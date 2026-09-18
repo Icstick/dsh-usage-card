@@ -2,7 +2,7 @@
 // dev-lessons 第 21 条的教训：模块级测试全绿但接线从未插入 = 假绿。
 // 这里真的调 apply(ctx)，检验：路由注册到了预期路径、handler 返回可解析的 JSON、事件被跟踪。
 import assert from 'node:assert/strict'
-import { apply, ROUTE } from '../src/index.mjs'
+import { apply, ROUTE, localFenceRejection } from '../src/index.mjs'
 
 let pass = 0
 // 必须 await：handler 已是 async，断言与取回 body 都要等
@@ -157,15 +157,26 @@ await t('非 GET → 405 且带 allow 头', async () => {
   assert.equal(r.status, 405)
   assert.equal(r.headers.allow, 'GET')
 })
-await t('栅栏服务缺席 → fail closed（403，不是放行）', async () => {
+await t('本地兜底栅栏：回环对端 + 回环 Host → 放行', () => {
+  assert.equal(localFenceRejection({ socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:3080' } }), undefined)
+  assert.equal(localFenceRejection({ socket: { remoteAddress: '::1' }, headers: { host: 'localhost:3080' } }), undefined)
+})
+await t('本地兜底栅栏：恶意 Host（DNS rebinding）→ 403', () => {
+  assert.equal(localFenceRejection({ socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'evil.example' } }), 403)
+})
+await t('本地兜底栅栏：非回环对端 → 403', () => {
+  assert.equal(localFenceRejection({ socket: { remoteAddress: '192.168.1.7' }, headers: { host: '127.0.0.1:3080' } }), 403)
+})
+await t('宿主的 connection 服务缺席时 → 退到本地栅栏，而不是一律 403（第一版就栽在这）', async () => {
   const capture = []
   const noFence = { ...ctx, connection: undefined, webServer: { register: (s) => { capture.push(s); return () => {} } } }
   apply(noFence)
   let body = ''
   const res = { statusCode: 0, headers: {}, setHeader(n, v) { this.headers[n] = v }, writeHead(c, h) { this.statusCode = c; Object.assign(this.headers, h ?? {}) }, end(chunk) { body += chunk ?? '' } }
-  await capture[0].handler({ url: ROUTE, method: 'GET', headers: { host: '127.0.0.1:3080' } }, res)
-  assert.equal(res.statusCode, 403)
-  assert.equal(body, '')
+  await capture[0].handler({ url: ROUTE, method: 'GET', headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } }, res)
+  assert.equal(res.statusCode, 200, '本机回环请求必须放行')
+  assert.equal(res.headers['x-usage-card-fence'], 'local')
+  assert.ok(body.length > 0)
 })
 
 console.log('设置接缝')

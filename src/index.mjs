@@ -62,16 +62,57 @@ function connectionOf(ctx) {
  * @param res - 传出响应
  * @returns true 表示已拒绝并结束响应
  */
+/** 回环地址集合（IPv4 / IPv6 / v4-mapped）。 */
+const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+
+/**
+ * 本地兜底栅栏：宿主的 connection 服务取不到时用。
+ *
+ * 两条检查各有分工：
+ *   - **对端必须是回环** —— 挡掉局域网/外网直连（TCP 层事实，伪造不了）；
+ *   - **Host 必须是回环或 localhost** —— 挡 DNS rebinding（恶意域名解析到 127.0.0.1 时，
+ *     浏览器会带上攻击者的 Host，正是 P0 复现里那一条）。
+ * 比宿主的完整栅栏弱（它还有浏览器 cookie 认证），但远好于零校验。
+ * @param req - 请求
+ * @returns 拒绝码，或 undefined 放行
+ */
+export function localFenceRejection(req) {
+  const peer = req?.socket?.remoteAddress
+  if (typeof peer === 'string' && peer !== '' && !LOOPBACK.has(peer)) return 403
+  const host = String(req?.headers?.host ?? '')
+  if (host === '') return undefined
+  const hostname = host.replace(/^\[/, '').replace(/\]:\d+$/, '').replace(/:\d+$/, '')
+  if (hostname !== 'localhost' && !LOOPBACK.has(hostname)) return 403
+  return undefined
+}
+
+/**
+ * 未通过栅栏就拒绝。
+ *
+ * **两级**：优先用宿主的 connection.requestRejection（含 Host/Origin 校验 + 浏览器认证）；
+ * 它在当前上下文不可达时（插件挂在 bundle 作用域、该服务注册在 web 子作用域）退到本地栅栏，
+ * **而不是一律 403** —— 第一版就是那样，结果把正常请求也全挡了，卡片直接不可用。
+ * @param ctx - 宿主上下文
+ * @param req - 传入请求
+ * @param res - 传出响应
+ * @returns true 表示已拒绝并结束响应
+ */
 export function rejectedByFence(ctx, req, res) {
   let status
+  let via = 'connection'
   try {
     const connection = connectionOf(ctx)
-    status = connection == null || typeof connection.requestRejection !== 'function'
-      ? 403
-      : connection.requestRejection(req)
+    if (connection != null && typeof connection.requestRejection === 'function') {
+      status = connection.requestRejection(req)
+    } else {
+      via = 'local'
+      status = localFenceRejection(req)
+    }
   } catch {
-    status = 403
+    via = 'local'
+    status = localFenceRejection(req)
   }
+  res.setHeader?.('x-usage-card-fence', via)
   if (status === undefined) return false
   res.statusCode = status
   res.end()
