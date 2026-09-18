@@ -207,7 +207,7 @@ function Card(props) {
       showAmount && c.outputUsd != null
         ? h('div', { style: { borderTop: '1px solid ' + HAIRLINE, marginTop: '6px', paddingTop: '5px' } },
             h('div', { style: rowStyle },
-              h('span', { style: { ...muted, title: '占比按 token 计；金额按各自单价折算（输出单价约为缓存读价的 200 倍）' } }, '输出（单独计价）'),
+              h('span', { style: { ...muted, title: '占比按 token 计（描述上下文＝输入侧）；本行是输出侧金额，不摊进上面的占比' } }, '输出'),
               h('span', { style: { ...mono, minWidth: '48px', textAlign: 'right' } }, fmtCny(c.outputUsd * (c.fx ? c.fx.rate : 1)))),
             h('div', { style: rowStyle },
               h('span', { style: { ...muted, marginTop: '2px' } }, '合计'),
