@@ -5,7 +5,9 @@ import { collectSubagents, resetSubagentCache } from '../src/index.mjs'
 
 // 枚举带 4 秒 TTL 缓存；每个用例前重置，保证测的是「这次调用」的行为
 // 包一层：每次调用前重置枚举缓存，测的才是「这次调用」的行为
-const collect = async (ctx, parentId, settings) => { resetSubagentCache(); return collectSubagents(ctx, parentId, settings) }
+// 固定到谷时（周五 05:00 UTC）：金额依赖墙钟，测试不能跟着跑的时间变
+const FIXED_NOW = new Date('2026-09-18T05:00:00Z')
+const collect = async (ctx, parentId, settings) => { resetSubagentCache(); return collectSubagents(ctx, parentId, settings, FIXED_NOW) }
 
 let pass = 0
 // 必须 await：断言写在 async 函数里，不 await 会先打印 ok 再跑断言（假绿）

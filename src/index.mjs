@@ -271,7 +271,7 @@ export function resetSubagentCache() {
   listCache = { at: 0, records: null }
 }
 
-export async function collectSubagents(ctx, parentId, settings) {
+export async function collectSubagents(ctx, parentId, settings, now = new Date()) {
   if (parentId == null) return { count: 0, measured: 0, released: 0, tokens: null, costCny: null, items: [], includedInTotal: false }
   let records
   try {
@@ -302,7 +302,7 @@ export async function collectSubagents(ctx, parentId, settings) {
     }
     const b = measured.buckets
     const total = b.uncachedInputTokens + b.cacheReadTokens + b.outputTokens
-    const price = priceFor(measured.model ?? null, new Date())
+    const price = priceFor(measured.model ?? null, now)
     const cost = computeCost(b, price, settings.fxRate)
     tokens += total
     if (cost.totalCny == null) priced = false
