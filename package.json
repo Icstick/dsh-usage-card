@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage-card",
-  "version": "0.8.0-m5",
+  "version": "0.9.0-ui",
   "description": "Sidebar card for DeepSeek Harness: per-session cost, token buckets, and context share by source.",
   "keywords": ["dsh", "deepseek-harness", "plugin", "usage", "cost", "token"],
   "license": "MIT",

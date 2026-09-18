@@ -2,7 +2,7 @@
 // dev-lessons 第 21 条的教训：模块级测试全绿但接线从未插入 = 假绿。
 // 这里真的调 apply(ctx)，检验：路由注册到了预期路径、handler 返回可解析的 JSON、事件被跟踪。
 import assert from 'node:assert/strict'
-import { apply, ROUTE, REPORT_ROUTE, localFenceRejection } from '../src/index.mjs'
+import { apply, ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, localFenceRejection } from '../src/index.mjs'
 
 let pass = 0
 // 必须 await：handler 已是 async，断言与取回 body 都要等
@@ -38,9 +38,9 @@ const ctx = {
 
 console.log('接线')
 await t('apply 可调用且不抛', () => apply(ctx))
-await t('两条只读路由都注册了（卡片 + 报告）', () => {
-  assert.equal(registered.length, 2)
-  for (const path of [ROUTE, REPORT_ROUTE]) {
+await t('三条只读路由都注册了（卡片 + 报告 + 会话列表）', () => {
+  assert.equal(registered.length, 3)
+  for (const path of [ROUTE, REPORT_ROUTE, SESSIONS_ROUTE]) {
     const route = registered.find((r) => r.path === path)
     assert.ok(route, '缺路由 ' + path)
     assert.equal(route.kind, 'exact')
@@ -181,6 +181,17 @@ await t('宿主的 connection 服务缺席时 → 退到本地栅栏，而不是
   assert.equal(res.statusCode, 200, '本机回环请求必须放行')
   assert.equal(res.headers['x-usage-card-fence'], 'local')
   assert.ok(body.length > 0)
+})
+
+await t('会话列表路由：同栅栏同方法白名单', async () => {
+  const route = registered.find((r) => r.path === SESSIONS_ROUTE)
+  const mk = () => ({ statusCode: 0, headers: {}, setHeader(n, v) { this.headers[n] = v }, writeHead(c, h) { this.statusCode = c; Object.assign(this.headers, h ?? {}) }, end() {} })
+  const evil = mk()
+  await route.handler({ url: SESSIONS_ROUTE, method: 'GET', headers: { host: 'evil.example' }, socket: { remoteAddress: '127.0.0.1' } }, evil)
+  assert.equal(evil.statusCode, 403, '恶意 Host 必须被挡')
+  const post = mk()
+  await route.handler({ url: SESSIONS_ROUTE, method: 'POST', headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } }, post)
+  assert.equal(post.statusCode, 405)
 })
 
 console.log('设置接缝')

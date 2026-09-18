@@ -46,6 +46,9 @@ export const ROUTE = '/usage-card/current.json'
 /** 报告导出路由（Markdown / CSV）。 */
 export const REPORT_ROUTE = '/usage-card/report'
 
+/** 会话列表路由（给设置页的勾选列表用）。 */
+export const SESSIONS_ROUTE = '/usage-card/sessions'
+
 /**
  * 宿主的 connection 服务（请求信任栅栏）。
  *
@@ -773,11 +776,19 @@ export function apply(ctx) {
    * @param format - 'md' | 'csv'
    * @param settings - 已解析的设置
    */
-  const reportFor = (format, settings) => {
-    const key = format + '|' + settings.fxRate
+  /** 折叠结果缓存：读日志是重活（本机 ~1.2 s），会话列表与报告共用。 */
+  const sessionsCache = new Map()
+  const SESSIONS_TTL_MS = 30000
+
+  /**
+   * 折叠全部会话（带缓存）。
+   * @param settings - 已解析的设置
+   */
+  const computeSessions = (settings) => {
+    const key = String(settings.fxRate)
     const now = Date.now()
-    const cached = reportCache.get(key)
-    if (cached !== undefined && now - cached.at < REPORT_TTL_MS) return cached
+    const hit = sessionsCache.get(key)
+    if (hit !== undefined && now - hit.at < SESSIONS_TTL_MS) return hit.sessions
     const logs = listSessionLogs()
     const sessions = []
     let failed = 0
@@ -791,11 +802,31 @@ export function apply(ctx) {
         failed += 1
       }
     }
+    sessionsCache.set(key, { at: now, sessions, logs: logs.length - failed })
+    return sessions
+  }
+
+  /**
+   * 生成报告文本。
+   * @param format - 'md' | 'csv'
+   * @param settings - 已解析的设置
+   * @param only - 只导出这些会话 id（null = 全部）
+   */
+  const reportFor = (format, settings, only = null) => {
+    const key = format + '|' + settings.fxRate + '|' + (only == null ? '*' : only.join(','))
+    const now = Date.now()
+    const cached = reportCache.get(key)
+    if (cached !== undefined && now - cached.at < REPORT_TTL_MS) return cached
+    let sessions = computeSessions(settings)
+    if (only != null) {
+      const wanted = new Set(only)
+      sessions = sessions.filter((s) => wanted.has(s.sessionId))
+    }
     const report = buildReport(sessions, {
       fxRate: settings.fxRate,
       generatedAt: new Date().toISOString(),
       priceVersion: PRICES.generatedAt ?? null,
-      covers: logs.length - failed,
+      covers: sessions.length,
     })
     const body = format === 'csv' ? renderCsv(report) : renderMarkdown(report)
     const contentType = format === 'csv' ? 'text/csv; charset=utf-8' : 'text/markdown; charset=utf-8'
@@ -818,8 +849,12 @@ export function apply(ctx) {
         }
         try {
           const query = String(req.url ?? '').indexOf('?') < 0 ? '' : String(req.url).slice(String(req.url).indexOf('?') + 1)
-          const format = new URLSearchParams(query).get('format') === 'csv' ? 'csv' : 'md'
-          const { body, contentType } = reportFor(format, readSettings())
+          const params = new URLSearchParams(query)
+          const format = params.get('format') === 'csv' ? 'csv' : 'md'
+          // ?sessions=a,b,c —— 只导出勾选的会话；不带则全部
+          const raw = params.get('sessions')
+          const only = raw == null || raw === '' ? null : raw.split(',').map((s) => s.trim()).filter((s) => s !== '')
+          const { body, contentType } = reportFor(format, readSettings(), only)
           const stamp = new Date().toISOString().slice(0, 10)
           res.statusCode = 200
           res.setHeader('content-type', contentType)
@@ -835,4 +870,44 @@ export function apply(ctx) {
     })
     return () => { try { dispose?.() } catch { /* 已回收 */ } }
   }, 'usage-card: report route')
+
+  ctx.effect(() => {
+    const dispose = ctx.webServer.register({
+      kind: 'exact',
+      path: SESSIONS_ROUTE,
+      handler: (req, res) => {
+        if (rejectedByFence(ctx, req, res)) return
+        if (req.method !== 'GET') {
+          res.statusCode = 405
+          res.setHeader('allow', 'GET')
+          res.end()
+          return
+        }
+        try {
+          const settings = readSettings()
+          const sessions = computeSessions(settings)
+            .map((s) => ({
+              id: s.sessionId,
+              turns: s.turns,
+              tokens: s.totals.uncachedInputTokens + s.totals.cacheReadTokens + s.totals.cacheWriteTokens + s.totals.outputTokens,
+              usd: s.usd,
+              cny: s.usd * settings.fxRate,
+              first: s.first,
+              last: s.last,
+              unpricedTurns: s.unpricedTurns,
+            }))
+            .sort((a, b) => b.usd - a.usd)
+          res.statusCode = 200
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.setHeader('cache-control', 'no-store')
+          res.end(JSON.stringify({ ok: true, count: sessions.length, sessions }))
+        } catch (error) {
+          res.statusCode = 500
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ ok: false, reason: 'SESSIONS_FAILED', detail: String(error?.message ?? error).slice(0, 200) }))
+        }
+      },
+    })
+    return () => { try { dispose?.() } catch { /* 已回收 */ } }
+  }, 'usage-card: sessions route')
 }
