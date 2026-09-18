@@ -270,4 +270,40 @@ await t('水位前进 → 缓存失效并重算', async () => {
   assert.equal(calls, 2, '水位前进后必须重算')
 })
 
+await t('历史回填：session.events 里的老轮次被补进账本（覆盖率不再恒为 1%）', async () => {
+  const sessB = {
+    header: { id: 'sess-backfill' },
+    events: [
+      { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } },
+      // 2026-09-18 02:00 UTC 落在峰时窗口（01:00-04:00）
+      { type: 'assistant/message', time: Date.parse('2026-09-18T02:00:00Z'), data: { usage: { inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0 } } },
+    ],
+  }
+  const captureB = []
+  const ctxB = {
+    ...ctx,
+    sessions: { get: (id) => (id === 'sess-backfill' ? sessB : undefined) },
+    tokenMeter: { measure: () => ({ logRevision: 1, nodes: [] }) },
+    sessionProjections: {
+      snapshot: () => ({ asOfSeq: 7, values: {
+        tokenUsage: { uncachedInputTokens: 1000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 100 },
+        contextBreakdown: { systemTokens: 1, toolsTokens: 1, messageTokens: 1 },
+        modelSelection: { lastUsed: { model: 'deepseek-flash' } },
+      } }),
+    },
+    webServer: { register: (s) => { captureB.push(s); return () => {} } },
+  }
+  apply(ctxB)
+  let body = ''
+  await captureB[0].handler(
+    { url: ROUTE + '?session=sess-backfill', method: 'GET', headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } },
+    { statusCode: 0, headers: {}, setHeader() {}, writeHead() {}, end(c) { body += c ?? '' } },
+  )
+  const p = JSON.parse(body)
+  assert.equal(p.cost.pricing.turns, 1, '回填应记入 1 轮')
+  assert.equal(p.cost.pricing.mode, 'per-turn', '总量与回填一致 → 精确模式（不打「含估算」）')
+  // 该轮在峰时：0.001M×0.3 + 0.0001M×1.2 = 0.00042
+  assert.ok(Math.abs(p.cost.totalUsd - 0.00042) < 1e-9, 'got ' + p.cost.totalUsd)
+})
+
 console.log('\n接线全部通过：' + pass + ' 项')

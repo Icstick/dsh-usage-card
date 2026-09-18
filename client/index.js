@@ -199,7 +199,7 @@ function Card(props) {
         ? h('div', { style: { ...muted, marginTop: '6px' } }, attr.pending || ('退回内核三元：' + attr.fallbackReason))
         : null),
 
-    (data.subagents && data.subagents.count > 0) ? h('div', { style: { borderTop: '1px solid ' + HAIRLINE, marginTop: '8px', paddingTop: '7px' } },
+    (data.subagents && (data.subagents.count > 0 || data.subagents.unavailable)) ? h('div', { style: { borderTop: '1px solid ' + HAIRLINE, marginTop: '8px', paddingTop: '7px' } },
       h('div', { style: rowStyle },
         h('span', { style: muted },
           'subagent · ' + data.subagents.count + ' 个',
@@ -214,7 +214,10 @@ function Card(props) {
       data.subagents.released > 0
         ? h('div', { style: { ...muted, marginTop: '4px' } }, '其中 ' + data.subagents.released + ' 个已释放，用量不可得（未计入合计）')
         : null,
-      h('div', { style: { ...muted, marginTop: '4px' } }, '独立会话，不计入上面的本会话合计')) : null)
+      h('div', { style: { ...muted, marginTop: '4px' } }, '独立会话，不计入上面的本会话合计'),
+      data.subagents.unavailable
+        ? h('div', { style: { ...muted, marginTop: '4px', color: '#b45309' } }, '子代理统计不可用：' + data.subagents.unavailable)
+        : null) : null)
 }
 
 /** 设置页 namespace，必须与宿主侧 SETTINGS_NAMESPACE 一致。 */

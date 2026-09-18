@@ -326,7 +326,29 @@ export async function collectSubagents(ctx, parentId, settings, now = new Date()
   } catch (error) {
     return { count: 0, measured: 0, released: 0, tokens: null, costCny: null, items: [], includedInTotal: false, unavailable: String(error?.message ?? error).slice(0, 120) }
   }
-  const children = records.filter((record) => record?.header?.parentSession === parentId)
+  // 收**全部后代**而不只是直接子会话：子代理还能再派子代理（delegationDepth > 1），
+  // 只按 parentSession === parentId 过滤会把孙代理静默漏掉。seen 兼防环。
+  const byParent = new Map()
+  for (const record of records) {
+    const parent = record?.header?.parentSession
+    if (parent == null) continue
+    const bucket = byParent.get(parent) ?? []
+    bucket.push(record)
+    byParent.set(parent, bucket)
+  }
+  const children = []
+  const seen = new Set([parentId])
+  const queue = [parentId]
+  while (queue.length > 0 && children.length < 500) {
+    const current = queue.shift()
+    for (const record of byParent.get(current) ?? []) {
+      const id = record?.header?.id
+      if (id == null || seen.has(id)) continue
+      seen.add(id)
+      children.push(record)
+      queue.push(id)
+    }
+  }
   const items = []
   let tokens = 0
   let cny = 0
@@ -425,7 +447,8 @@ export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS, 
     cacheWriteTokens: totals.cacheWriteTokens ?? 0,
     outputTokens: totals.outputTokens ?? 0,
   }
-  const billed = buckets.uncachedInputTokens + buckets.cacheReadTokens + buckets.outputTokens
+  // 与内核口径一致：计费 token 含 cacheWrite（DeepSeek 侧恒为 0，但换 provider 就不一定了）
+  const billed = buckets.uncachedInputTokens + buckets.cacheReadTokens + buckets.cacheWriteTokens + buckets.outputTokens
   // now 可注入：金额依赖墙钟（峰谷），不可注入的测试会在跨过峰谷边界时无故变红。
   const price = priceFor(effectiveModel, now)
   const fx = fxSnapshot(settings)
@@ -460,7 +483,7 @@ export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS, 
       unpricedTurns: fold.unpricedTurns,
     }
   }
-  const denom = buckets.cacheReadTokens + buckets.uncachedInputTokens
+  const denom = buckets.cacheReadTokens + buckets.uncachedInputTokens + buckets.cacheWriteTokens
   const breakdown = values.contextBreakdown
   // 六类归因：逐节点定价 + 事件类型分类（M2）。失败则退回内核三元，绝不整体消失。
   let attribution = null
@@ -569,6 +592,8 @@ export function apply(ctx) {
 
   /** 按轮计价账本：会话 id → 逐轮累加的四桶与金额（峰谷按**每轮自己的时间**判定）。 */
   const folds = new Map()
+  /** 已经回填过的会话（回填是 O(事件数)，每个会话只做一次）。 */
+  const backfilled = new Set()
   /** 会话 id → 最近一次请求的模型（逐轮定价要用当时那个模型的价）。 */
   const sessionModels = new Map()
 
@@ -608,6 +633,48 @@ export function apply(ctx) {
       fold.usdOutput += (buckets.outputTokens / 1e6) * price.output
     }
     folds.set(id, fold)
+  }
+
+  /**
+   * 历史回填：把插件加载**之前**就发生的轮次也补进账本。
+   *
+   * 不做这一步的话，老会话永远只有加载后的几轮有精确价，其余只能线性估算
+   * （卡片上打「含估算」）。回填是 O(事件数) 且每个会话只做一次。
+   * 取事件有两条路：`session.events`（本机 loader 通过 snapshotEvents 补的访问器），
+   * 退路是按 seq 逐个 `eventAt`（内核注释说是 O(1) 下标）。
+   * @param session - 目标会话
+   */
+  const backfillTurns = (session) => {
+    const id = session?.header?.id ?? session?.id
+    if (id == null || backfilled.has(id)) return
+    backfilled.add(id)
+    let events = null
+    try {
+      const maybe = session.events
+      if (Array.isArray(maybe)) events = maybe
+    } catch { /* 访问器不可用，走退路 */ }
+    if (events === null) {
+      try {
+        const end = Number(session.seq)
+        if (Number.isFinite(end) && end > 0 && typeof session.eventAt === 'function') {
+          events = []
+          for (let i = 0; i <= end; i += 1) {
+            const e = session.eventAt(i)
+            if (e != null) events.push(e)
+          }
+        }
+      } catch { events = null }
+    }
+    if (events === null) return
+    // 按时间顺序走一遍：途中的 request/header 决定当时用的是哪个模型
+    for (const e of events) {
+      if (e?.type === 'request/header') {
+        const model = e.data?.header?.config?.model
+        if (typeof model === 'string') sessionModels.set(id, model)
+      } else if (e?.type === 'assistant/message') {
+        recordTurn(session, e)
+      }
+    }
   }
 
   ctx.effect(() => {
@@ -652,6 +719,8 @@ export function apply(ctx) {
             // 解析不到就诚实说「该会话未加载」，绝不悄悄显示另一个会话的数字
             payload = { ok: false, schemaVersion: 1, reason: 'SESSION_NOT_LOADED', session: { id: requested } }
           } else {
+            // 先把历史轮次补进账本，再算价格（同一会话只补一次；O(事件数)）
+            if (target != null) backfillTurns(target)
             // 水位取不到（投影服务异常）就退化为不缓存，仍然返回正确数据
             let watermark = null
             try {

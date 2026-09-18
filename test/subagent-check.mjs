@@ -97,6 +97,24 @@ await t('全部都释放时 → tokens/costCny 为 null，而不是 0（不假�
   assert.equal(r.costCny, null)
 })
 
+await t('孙代理（delegationDepth 2）也收进来，不再静默漏计', async () => {
+  const ctxN = {
+    sessions: { get: () => undefined },
+    sessionProjections: { snapshot: () => ({ values: {} }) },
+    sessionQuery: {
+      listSessions: async () => [
+        { header: { id: 'c1', parentSession: PARENT, delegationDepth: 1 }, live: false },
+        { header: { id: 'g1', parentSession: 'c1', delegationDepth: 2 }, live: false },
+        { header: { id: 'unrelated', parentSession: 'someone-else', delegationDepth: 1 }, live: false },
+      ],
+    },
+  }
+  const r = await collect(ctxN, PARENT, SETTINGS)
+  assert.equal(r.count, 2, '直接子 + 孙都应计入')
+  assert.ok(r.items.some((i) => i.id === 'g1'))
+  assert.ok(!r.items.some((i) => i.id === 'unrelated'))
+})
+
 await t('没有 parentId → 空结果', async () => {
   const r = await collect(makeCtx(), null, SETTINGS)
   assert.equal(r.count, 0)

@@ -8,7 +8,11 @@ let json = null
 try { json = JSON.parse(text) } catch { /* 非 JSON，下面原样打印 */ }
 if (json === null) { console.log('不是 JSON，前 300 字：\n' + text.slice(0, 300)); process.exit(1) }
 console.log('ok           ' + json.ok)
-if (json.ok !== true) { console.log('reason       ' + json.reason + (json.detail ? ' (' + json.detail + ')' : '')); process.exit(0) }
+if (json.ok !== true) {
+  // 非 ok 是失败，退出码必须非 0 —— 否则脚本在 CI/自检里永远「通过」
+  console.log('reason       ' + json.reason + (json.detail ? ' (' + json.detail + ')' : ''))
+  process.exit(1)
+}
 console.log('session      ' + json.session.id + '  模型 ' + json.session.model + ' / 档位 ' + json.session.peakTier)
 console.log('measured     未命中 ' + json.measured.uncachedInputTokens + '  命中 ' + json.measured.cacheReadTokens +
             '  输出 ' + json.measured.outputTokens + '  命中率 ' + (json.measured.cacheHitRate * 100).toFixed(1) + '%')
