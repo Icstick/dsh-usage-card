@@ -91,7 +91,21 @@ export function foldSession(events, deps) {
   let usd = 0
   let first = null
   let last = null
+  // 会话身份：标题来自 session/title（后者覆盖前者），子代理标记来自日志首行的 header
+  let title = null
+  let depth = 0
+  let parent = null
   for (const event of events) {
+    if (event?.type === 'session') {
+      depth = Number(event.delegationDepth ?? 0)
+      parent = event.parentSession ?? null
+      continue
+    }
+    if (event?.type === 'session/title') {
+      const t = event.data?.title
+      if (typeof t === 'string' && t !== '') title = t
+      continue
+    }
     if (event?.type === 'request/header') {
       const m = event.data?.header?.config?.model
       if (typeof m === 'string') model = m
@@ -135,9 +149,20 @@ export function foldSession(events, deps) {
   }
   return {
     sessionId, turns, unpricedTurns, usd, totals, first, last,
+    title: title === null ? null : title.replace(/\s+/g, ' ').trim().slice(0, 60),
+    depth, parent,
     days: [...byDay.values()].sort((a, b) => (a.day < b.day ? -1 : 1)),
     models: [...byModel.values()].sort((a, b) => b.usd - a.usd),
   }
+}
+
+/**
+ * 只保留用户发起的会话（子代理是 delegationDepth > 0）。
+ * @param sessions - 折叠结果
+ * @param include - true 时连子代理一起要
+ */
+export function userSessions(sessions, include = false) {
+  return include ? sessions : sessions.filter((s) => (s.depth ?? 0) === 0)
 }
 
 /** 把多个会话折叠结果合成一份报告。 */

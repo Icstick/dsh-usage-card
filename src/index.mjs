@@ -12,7 +12,7 @@
  */
 import { readFileSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
-import { buildReport, foldSession, listSessionLogs, readSessionLog, renderCsv, renderMarkdown } from './report.mjs'
+import { buildReport, foldSession, listSessionLogs, readSessionLog, renderCsv, renderMarkdown, userSessions } from './report.mjs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -48,6 +48,37 @@ export const REPORT_ROUTE = '/usage-card/report'
 
 /** 会话列表路由（给设置页的勾选列表用）。 */
 export const SESSIONS_ROUTE = '/usage-card/sessions'
+
+/** 汇率同步路由（手动触发）。 */
+export const SYNC_FX_ROUTE = '/usage-card/sync-fx'
+
+/** 汇率来源，按顺序试，第一个成功的胜出（实测本机三个都可达）。 */
+export const FX_SOURCES = [
+  { id: 'open.er-api.com', url: 'https://open.er-api.com/v6/latest/USD', pick: (j) => j?.rates?.CNY },
+  { id: 'exchangerate-api.com', url: 'https://api.exchangerate-api.com/v4/latest/USD', pick: (j) => j?.rates?.CNY },
+  { id: 'frankfurter.app', url: 'https://api.frankfurter.app/latest?from=USD&to=CNY', pick: (j) => j?.rates?.CNY },
+]
+
+/**
+ * 拉一次 USD→CNY 汇率。逐个源试，第一个给出**合理值**的胜出。
+ * 合理性检查是必须的：拿到一个离谱的数（0、null、负）宁可失败，也不要写进设置。
+ * @param fetchImpl - 注入以便测试
+ * @returns { rate, source } 或 null
+ */
+export async function fetchUsdCny(fetchImpl = fetch) {
+  for (const source of FX_SOURCES) {
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 8000)
+      const res = await fetchImpl(source.url, { signal: controller.signal })
+      clearTimeout(timer)
+      if (!res.ok) continue
+      const rate = Number(source.pick(await res.json()))
+      if (Number.isFinite(rate) && rate > 1 && rate < 20) return { rate, source: source.id }
+    } catch { /* 试下一个源 */ }
+  }
+  return null
+}
 
 /**
  * 宿主的 connection 服务（请求信任栅栏）。
@@ -812,12 +843,12 @@ export function apply(ctx) {
    * @param settings - 已解析的设置
    * @param only - 只导出这些会话 id（null = 全部）
    */
-  const reportFor = (format, settings, only = null) => {
-    const key = format + '|' + settings.fxRate + '|' + (only == null ? '*' : only.join(','))
+  const reportFor = (format, settings, only = null, includeSubagents = false) => {
+    const key = format + '|' + settings.fxRate + '|' + (only == null ? '*' : only.join(',')) + '|' + (includeSubagents ? 'sub' : 'user')
     const now = Date.now()
     const cached = reportCache.get(key)
     if (cached !== undefined && now - cached.at < REPORT_TTL_MS) return cached
-    let sessions = computeSessions(settings)
+    let sessions = userSessions(computeSessions(settings), includeSubagents)
     if (only != null) {
       const wanted = new Set(only)
       sessions = sessions.filter((s) => wanted.has(s.sessionId))
@@ -854,7 +885,8 @@ export function apply(ctx) {
           // ?sessions=a,b,c —— 只导出勾选的会话；不带则全部
           const raw = params.get('sessions')
           const only = raw == null || raw === '' ? null : raw.split(',').map((s) => s.trim()).filter((s) => s !== '')
-          const { body, contentType } = reportFor(format, readSettings(), only)
+          const includeSubagents = params.get('subagents') === '1'
+          const { body, contentType } = reportFor(format, readSettings(), only, includeSubagents)
           const stamp = new Date().toISOString().slice(0, 10)
           res.statusCode = 200
           res.setHeader('content-type', contentType)
@@ -885,9 +917,14 @@ export function apply(ctx) {
         }
         try {
           const settings = readSettings()
-          const sessions = computeSessions(settings)
+          const query = String(req.url ?? '').indexOf('?') < 0 ? '' : String(req.url).slice(String(req.url).indexOf('?') + 1)
+          const includeSubagents = new URLSearchParams(query).get('subagents') === '1'
+          const sessions = userSessions(computeSessions(settings), includeSubagents)
             .map((s) => ({
               id: s.sessionId,
+              title: s.title ?? null,
+              depth: s.depth ?? 0,
+              parent: s.parent ?? null,
               turns: s.turns,
               tokens: s.totals.uncachedInputTokens + s.totals.cacheReadTokens + s.totals.cacheWriteTokens + s.totals.outputTokens,
               usd: s.usd,
@@ -910,4 +947,38 @@ export function apply(ctx) {
     })
     return () => { try { dispose?.() } catch { /* 已回收 */ } }
   }, 'usage-card: sessions route')
+
+  ctx.effect(() => {
+    const dispose = ctx.webServer.register({
+      kind: 'exact',
+      path: SYNC_FX_ROUTE,
+      handler: async (req, res) => {
+        if (rejectedByFence(ctx, req, res)) return
+        // 会改设置，所以只收 POST（同源表单/JS 才能发）
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.setHeader('allow', 'POST')
+          res.end()
+          return
+        }
+        res.setHeader('content-type', 'application/json; charset=utf-8')
+        res.setHeader('cache-control', 'no-store')
+        try {
+          const found = await fetchUsdCny()
+          if (found === null) {
+            res.statusCode = 502
+            res.end(JSON.stringify({ ok: false, reason: 'FX_UNAVAILABLE' }))
+            return
+          }
+          if (settingsScope !== null) await settingsScope.update({ fxRate: found.rate })
+          res.statusCode = 200
+          res.end(JSON.stringify({ ok: true, rate: found.rate, source: found.source, at: new Date().toISOString() }))
+        } catch (error) {
+          res.statusCode = 500
+          res.end(JSON.stringify({ ok: false, reason: 'FX_FAILED', detail: String(error?.message ?? error).slice(0, 160) }))
+        }
+      },
+    })
+    return () => { try { dispose?.() } catch { /* 已回收 */ } }
+  }, 'usage-card: sync-fx route')
 }
