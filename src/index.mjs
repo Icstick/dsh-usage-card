@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url'
 /** Cordis 插件名。 */
 export const name = 'usage-card'
 /** 依赖的服务；缺任一则 fiber 保持 pending，不会半死。sessions 用于按 id 解析客户端正在看的会话。 */
-export const inject = ['webServer', 'sessionProjections', 'sessions', 'tokenMeter', 'settings']
+export const inject = ['webServer', 'sessionProjections', 'sessions', 'sessionQuery', 'tokenMeter', 'settings']
 
 /** 设置页 namespace；与客户端设置卡片必须一致。 */
 export const SETTINGS_NAMESPACE = 'dsh-usage-card'
@@ -186,6 +186,93 @@ export function attribute(ctx, session, toolsTokens) {
 }
 
 /**
+ * 读一个会话的实测四桶与模型（供子代理归集用）。
+ * @param ctx - 上下文
+ * @param session - 目标会话对象
+ * @returns { buckets, model } 或 null（取不到就返回 null，绝不填 0 冒充）
+ */
+function measuredUsageOf(ctx, session) {
+  try {
+    const values = ctx.sessionProjections.snapshot(session).values
+    const totals = values.tokenUsage
+    if (totals == null) return null
+    return {
+      buckets: {
+        uncachedInputTokens: totals.uncachedInputTokens ?? 0,
+        cacheReadTokens: totals.cacheReadTokens ?? 0,
+        cacheWriteTokens: totals.cacheWriteTokens ?? 0,
+        outputTokens: totals.outputTokens ?? 0,
+      },
+      model: values.modelSelection?.lastUsed?.model ?? null,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 归集本会话的直接子代理用量。
+ *
+ * 子代理是**独立会话**（header.parentSession 指回本会话），用量取它们自己的四桶 —— 所以这是
+ * 实测而不是估算，可以精确计费。但一次性子代理跑完会被释放，那时它的会话对象不在 live 集合里，
+ * 用量取不到：这种情况**如实计入 released 计数**，而不是当作 0 悄悄抹掉。
+ * @param ctx - 上下文
+ * @param parentId - 本会话 id
+ * @param settings - 已解析的设置
+ */
+export async function collectSubagents(ctx, parentId, settings) {
+  if (parentId == null) return { count: 0, measured: 0, released: 0, tokens: null, costCny: null, items: [], includedInTotal: false }
+  let records
+  try {
+    records = await ctx.sessionQuery.listSessions()
+  } catch (error) {
+    return { count: 0, measured: 0, released: 0, tokens: null, costCny: null, items: [], includedInTotal: false, unavailable: String(error?.message ?? error).slice(0, 120) }
+  }
+  const children = records.filter((record) => record?.header?.parentSession === parentId)
+  const items = []
+  let tokens = 0
+  let cny = 0
+  let priced = true
+  let released = 0
+  for (const record of children) {
+    const id = record.header.id
+    const node = ctx.sessions.get(id)
+    const measured = node === undefined ? null : measuredUsageOf(ctx, node)
+    if (measured === null) {
+      released += 1
+      items.push({ id, label: record.header.agentPreset ?? null, depth: record.header.delegationDepth ?? 1, mode: record.header.isSeeded === true ? 'seeded' : 'one-shot', tokens: null, costCny: null, note: node === undefined ? '会话已释放，用量不可得' : '该子会话尚未产生用量' })
+      continue
+    }
+    const b = measured.buckets
+    const total = b.uncachedInputTokens + b.cacheReadTokens + b.outputTokens
+    const price = priceFor(measured.model ?? null, new Date())
+    const cost = computeCost(b, price, settings.fxRate)
+    tokens += total
+    if (cost.totalCny == null) priced = false
+    else cny += cost.totalCny
+    items.push({
+      id,
+      label: record.header.agentPreset ?? null,
+      depth: record.header.delegationDepth ?? 1,
+      mode: record.live === true ? 'live' : 'ended',
+      model: measured.model ?? null,
+      tokens: total,
+      costCny: cost.totalCny,
+      unpriced: cost.unpriced,
+    })
+  }
+  return {
+    count: items.length,
+    measured: items.length - released,
+    released,
+    tokens: items.length === 0 ? 0 : tokens,
+    costCny: priced ? cny : null,
+    includedInTotal: false,
+    items,
+  }
+}
+
+/**
  * 当前汇率快照。取自设置页的 fxRate；M4 接自动更新（拉取失败再退回这里的手动值）。
  * @param settings - 已解析的设置值
  */
@@ -308,7 +395,8 @@ export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS) 
     },
     display: { showAmount: settings.showAmount, showAttribution: settings.showAttribution },
     attribution,
-    subagents: { count: 0, tokens: null, costCny: null, includedInTotal: false, items: [], pending: 'M3' },
+    // 由路由在 buildPayload 之后填入（需要异步枚举会话）；这里是同步路径的占位
+    subagents: { count: 0, measured: 0, released: 0, tokens: null, costCny: null, includedInTotal: false, items: [] },
   }
 }
 
@@ -352,18 +440,27 @@ export function apply(ctx) {
     const dispose = ctx.webServer.register({
       kind: 'exact',
       path: ROUTE,
-      handler: (req, res) => {
+      handler: async (req, res) => {
         let payload
         try {
           const requested = sessionIdFrom(req.url)
+          const settings = readSettings()
           if (requested == null) {
-            payload = buildPayload(ctx, currentSession, currentModel, readSettings())
+            payload = buildPayload(ctx, currentSession, currentModel, settings)
           } else {
             const resolved = ctx.sessions.get(requested)
             // 解析不到就诚实说「该会话未加载」，绝不悄悄显示另一个会话的数字
             payload = resolved === undefined
               ? { ok: false, schemaVersion: 1, reason: 'SESSION_NOT_LOADED', session: { id: requested } }
-              : buildPayload(ctx, resolved, currentModel, readSettings())
+              : buildPayload(ctx, resolved, currentModel, settings)
+          }
+          // 子代理归集是异步的（要枚举会话），失败不影响主卡片
+          if (payload.ok === true && payload.session?.id != null) {
+            try {
+              payload.subagents = await collectSubagents(ctx, payload.session.id, settings)
+            } catch (error) {
+              payload.subagents = { count: 0, measured: 0, released: 0, tokens: null, costCny: null, items: [], includedInTotal: false, unavailable: String(error?.message ?? error).slice(0, 120) }
+            }
           }
         } catch (error) {
           payload = { ok: false, reason: 'INTERNAL', detail: String(error?.message ?? error).slice(0, 200) }

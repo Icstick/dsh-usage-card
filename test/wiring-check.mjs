@@ -5,7 +5,8 @@ import assert from 'node:assert/strict'
 import { apply, ROUTE } from '../src/index.mjs'
 
 let pass = 0
-const t = (name, fn) => { fn(); pass++; console.log('  ok  ' + name) }
+// 必须 await：handler 已是 async，断言与取回 body 都要等
+const t = async (name, fn) => { await fn(); pass++; console.log('  ok  ' + name) }
 
 const registered = []
 const listeners = new Map()
@@ -47,28 +48,28 @@ t('注册了可回收的 effect（卸载不泄漏）', () => assert.ok(effects.l
 
 console.log('路由行为')
 const handler = registered[0].handler
-function call() {
+async function call() {
   let body = ''
   const res = { statusCode: 0, headers: null, writeHead(code, headers) { this.statusCode = code; this.headers = headers }, end(chunk) { body += chunk } }
-  handler({ url: ROUTE, method: 'GET' }, res)
+  await handler({ url: ROUTE, method: 'GET' }, res)
   return { status: res.statusCode, headers: res.headers, json: JSON.parse(body) }
 }
 
-t('无事件时返回 NO_SESSION（不是 500，也不是 0）', () => {
-  const r = call()
+t('无事件时返回 NO_SESSION（不是 500，也不是 0）', async () => {
+  const r = await call()
   assert.equal(r.status, 200)
   assert.equal(r.json.ok, false)
   assert.equal(r.json.reason, 'NO_SESSION')
 })
-t('收到事件后返回真实 payload', () => {
+t('收到事件后返回真实 payload', async () => {
   listeners.get('session/event')(fakeSession, { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } })
-  const r = call()
+  const r = await call()
   assert.equal(r.json.ok, true)
   assert.equal(r.json.session.model, 'deepseek-flash')
   assert.equal(r.json.measured.totalTokens, 1000 + 9000 + 500)
 })
-t('响应头是 JSON 且禁缓存', () => {
-  const r = call()
+t('响应头是 JSON 且禁缓存', async () => {
+  const r = await call()
   assert.match(r.headers['Content-Type'], /application\/json/)
   assert.equal(r.headers['Cache-Control'], 'no-store')
 })
@@ -103,24 +104,24 @@ const capture2 = []
 const c3 = { ...ctx2, webServer: { register: (s) => { capture2.push(s); return () => {} } } }
 apply(c3)
 listeners.get('session/event')(fakeSession, { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } })
-const call2 = (url) => {
+const call2 = async (url) => {
   let body = ''
-  capture2[0].handler({ url }, { writeHead() {}, end(chunk) { body += chunk } })
+  await capture2[0].handler({ url }, { writeHead() {}, end(chunk) { body += chunk } })
   return JSON.parse(body)
 }
-t('带 ?session= 时按该会话取数（而不是「最近有事件」的那个）', () => {
-  const p = call2(ROUTE + '?session=sess-other')
+t('带 ?session= 时按该会话取数（而不是「最近有事件」的那个）', async () => {
+  const p = await call2(ROUTE + '?session=sess-other')
   assert.equal(p.ok, true)
   assert.equal(p.session.id, 'sess-other')
   assert.equal(p.measured.totalTokens, 7 + 3 + 1)
 })
-t('不带 session 时退回最近事件会话', () => {
-  const p = call2(ROUTE)
+t('不带 session 时退回最近事件会话', async () => {
+  const p = await call2(ROUTE)
   assert.equal(p.session.id, 'sess-wiring')
   assert.equal(p.measured.totalTokens, 10500)
 })
-t('会话解析不到 → SESSION_NOT_LOADED（不显示别人的数字）', () => {
-  const p = call2(ROUTE + '?session=does-not-exist')
+t('会话解析不到 → SESSION_NOT_LOADED（不显示别人的数字）', async () => {
+  const p = await call2(ROUTE + '?session=does-not-exist')
   assert.equal(p.ok, false)
   assert.equal(p.reason, 'SESSION_NOT_LOADED')
   assert.equal(p.measured, undefined)
