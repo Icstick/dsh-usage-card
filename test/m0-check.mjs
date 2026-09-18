@@ -104,6 +104,25 @@ t('未定价模型：unpriced=true，占比不给钱', () => {
   assert.equal(p.attribution.rows[0].costCny, null)
 })
 
+console.log('按轮计价（P0 回归：跨峰谷不能整会话一个档位）')
+await t('峰谷各半的两轮：金额按各自时刻定价，不是整会话按轮询那刻', async () => {
+  const totals = { uncachedInputTokens: 2_000_000, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 }
+  const ctxPT = {
+    sessionProjections: { snapshot: () => ({ asOfSeq: 1, values: {
+      tokenUsage: totals,
+      contextBreakdown: { systemTokens: 1, toolsTokens: 1, messageTokens: 1 },
+      modelSelection: { lastUsed: { model: 'deepseek-flash' } },
+    } }) },
+  }
+  // 一轮峰时（miss 0.3）+ 一轮谷时（miss 0.15），各 1M 未命中输入
+  const fold = { uncachedInputTokens: 2_000_000, cacheReadTokens: 0, outputTokens: 0, usdInput: 0.3 + 0.15, usdOutput: 0, turns: 2, unpricedTurns: 0 }
+  const p = buildPayload(ctxPT, sess, null, { fxRate: 7.2, showAmount: true, showAttribution: true }, fold, new Date('2026-09-18T05:00:00Z'))
+  assert.equal(p.cost.pricing.mode, 'per-turn')
+  assert.equal(p.cost.pricing.turns, 2)
+  assert.ok(Math.abs(p.cost.totalUsd - 0.45) < 1e-9, '应等于 0.3+0.15，实得 ' + p.cost.totalUsd)
+  assert.ok(Math.abs(p.cost.totalUsd - 0.30) > 1e-6, '不能是整会话按谷价的 0.30')
+})
+
 console.log('模型解析（回归：插件后装时事件早过去了）')
 const ctxWithSelection = {
   sessionProjections: {
@@ -123,7 +142,8 @@ t('模型取自 modelSelection 投影，不依赖事件跟踪', () => {
   assert.ok(p.cost.totalCny > 0)
 })
 t('v4-pro 按自己的价算（不是 flash 价）', () => {
-  const p = buildPayload(ctxWithSelection, sess, null)
+  // 固定到谷时（2026-09-18 是周五，05:00 UTC 不在峰时窗口内）——金额依赖墙钟，测试不能跟着跑的时间变
+  const p = buildPayload(ctxWithSelection, sess, null, { fxRate: 7.2, showAmount: true, showAttribution: true }, null, new Date('2026-09-18T05:00:00Z'))
   const usd = (96266 / 1e6) * 0.66 + (6955648 / 1e6) * 0.022 + (67618 / 1e6) * 1.98
   assert.ok(Math.abs(p.cost.totalUsd - usd) < 1e-9, 'got ' + p.cost.totalUsd)
 })
@@ -145,6 +165,8 @@ t('未定价时占比照常给出，只有金额为 null', () => {
 console.log('M2 六类归因')
 t('事件分类：真人消息在 spliced，不在 user/message', () => {
   assert.deepEqual(classifyEvent({ type: 'user/message' }), { inject: 1 })
+  // 实测纠正：真人消息就是 user/message(source.kind==='user')，不再一律算注入
+  assert.deepEqual(classifyEvent({ type: 'user/message', data: { source: { kind: 'user' } } }), { user: 1 })
   assert.deepEqual(classifyEvent({ type: 'agent/inbox/spliced', data: { inserted: [{ source: { kind: 'user' }, content: 'hi' }] } }), { user: 1 })
   assert.deepEqual(classifyEvent({ type: 'system/message' }), { system: 1 })
   assert.deepEqual(classifyEvent({ type: 'tool/result' }), { toolResult: 1 })

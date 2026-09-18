@@ -168,7 +168,12 @@ export function classifyEvent(event) {
   if (type === 'system/message') return { system: 1 }
   if (type === 'assistant/message' || type === 'assistant/attempt') return { assistant: 1 }
   if (type === 'tool/result' || type === 'tool/call') return { toolResult: 1 }
-  if (type === 'user/message') return { inject: 1 }
+  if (type === 'user/message') {
+    // 实测纠正：真人消息**就是** user/message，判据是 source.kind === 'user'。
+    // 之前一律判成 inject，导致「用户消息」恒为 0 —— 这是归因里最核心的一行。
+    // agent/inbox/spliced 里也能见到真人消息，但那不是 surface 事件，属兜底分支。
+    return event.data?.source?.kind === 'user' ? { user: 1 } : { inject: 1 }
+  }
   if (type === 'agent/inbox/spliced') {
     const items = Array.isArray(event.data?.inserted) ? event.data.inserted : []
     let user = 0
@@ -317,8 +322,9 @@ export async function collectSubagents(ctx, parentId, settings) {
     count: items.length,
     measured: items.length - released,
     released,
-    tokens: items.length === 0 ? 0 : tokens,
-    costCny: priced ? cny : null,
+    // 全释放时不能回落成 0：那是「取不到」，不是「花了 0」。违反本插件自己的红线。
+    tokens: items.length === 0 ? 0 : (items.length - released === 0 ? null : tokens),
+    costCny: priced && !(items.length > 0 && items.length - released === 0) ? cny : null,
     includedInTotal: false,
     items,
   }
@@ -350,7 +356,7 @@ function fxSnapshot(settings) {
  * @param model - 事件跟踪到的模型（仅作 modelSelection 缺席时的兜底）
  * @param settings - 已解析的设置值（默认与 schema 默认一致）
  */
-export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS) {
+export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS, fold = null, now = new Date()) {
   const base = {
     ok: true,
     schemaVersion: 1,
@@ -379,9 +385,40 @@ export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS) 
     outputTokens: totals.outputTokens ?? 0,
   }
   const billed = buckets.uncachedInputTokens + buckets.cacheReadTokens + buckets.outputTokens
-  const price = priceFor(effectiveModel, new Date())
+  // now 可注入：金额依赖墙钟（峰谷），不可注入的测试会在跨过峰谷边界时无故变红。
+  const price = priceFor(effectiveModel, now)
   const fx = fxSnapshot(settings)
-  const cost = computeCost(buckets, price, fx.rate)
+  const linear = computeCost(buckets, price, fx.rate)
+  let cost = linear
+  /** 计价模式：per-turn = 每轮按自己的时刻定价（精确）；mixed = 含插件加载前的线性估算部分。 */
+  let pricing = { mode: 'session-linear', turns: 0, coverage: 0, note: '插件加载前的部分只能按当前档位线性估算' }
+  if (fold != null && fold.turns > 0) {
+    // 差集 = 插件加载前就产生的用量（我们没见过那些轮次的时间），只能按当前档位估。
+    const remainder = {
+      uncachedInputTokens: Math.max(0, buckets.uncachedInputTokens - fold.uncachedInputTokens),
+      cacheReadTokens: Math.max(0, buckets.cacheReadTokens - fold.cacheReadTokens),
+      cacheWriteTokens: 0,
+      outputTokens: Math.max(0, buckets.outputTokens - fold.outputTokens),
+    }
+    const remTotal = remainder.uncachedInputTokens + remainder.cacheReadTokens + remainder.outputTokens
+    const remCost = computeCost(remainder, price, fx.rate)
+    const inputUsd = (remCost.inputUsd ?? 0) + fold.usdInput
+    const outputUsd = (remCost.outputUsd ?? 0) + fold.usdOutput
+    const totalUsd = inputUsd + outputUsd
+    cost = {
+      unpriced: (remTotal > 0 && linear.unpriced) || fold.unpricedTurns > 0,
+      inputUsd,
+      outputUsd,
+      totalUsd,
+      totalCny: totalUsd * fx.rate,
+    }
+    pricing = {
+      mode: remTotal === 0 && fold.unpricedTurns === 0 ? 'per-turn' : 'mixed',
+      turns: fold.turns,
+      coverage: billed > 0 ? Math.min(1, (billed - remTotal) / billed) : 1,
+      unpricedTurns: fold.unpricedTurns,
+    }
+  }
   const denom = buckets.cacheReadTokens + buckets.uncachedInputTokens
   const breakdown = values.contextBreakdown
   // 六类归因：逐节点定价 + 事件类型分类（M2）。失败则退回内核三元，绝不整体消失。
@@ -443,6 +480,7 @@ export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS) 
       outputUsd: cost.outputUsd,
       totalCny: cost.totalCny,
       fx,
+      pricing,
       priceVersion: PRICES.generatedAt ?? null,
     },
     display: { showAmount: settings.showAmount, showAttribution: settings.showAttribution },
@@ -488,13 +526,61 @@ export function apply(ctx) {
     return () => { settingsScope = null }
   }, 'usage-card: settings')
 
+  /** 按轮计价账本：会话 id → 逐轮累加的四桶与金额（峰谷按**每轮自己的时间**判定）。 */
+  const folds = new Map()
+  /** 会话 id → 最近一次请求的模型（逐轮定价要用当时那个模型的价）。 */
+  const sessionModels = new Map()
+
+  /**
+   * 把一条 assistant/message 记进按轮账本。
+   * 峰谷是时段价：整会话按「轮询那一刻」定价，跨峰谷必然错（差可达 2 倍）。
+   * @param session - 事件所属会话
+   * @param event - 事件
+   */
+  const recordTurn = (session, event) => {
+    const usage = event?.data?.usage
+    const time = event?.time
+    if (usage == null || typeof time !== 'number') return
+    // 时间戳必须是毫秒（实测 event.time 是 epoch ms）。异常就跳过这条，
+    // 宁可让它落到「线性估算」里，也不要拿错的时间去判峰谷。
+    if (Math.abs(Date.now() - time) > 2 * 365 * 24 * 3600 * 1000) return
+    const id = session?.header?.id ?? session?.id
+    if (id == null) return
+    const buckets = {
+      uncachedInputTokens: usage.inputTokens ?? 0,
+      cacheReadTokens: usage.cacheReadTokens ?? 0,
+      outputTokens: usage.outputTokens ?? 0,
+    }
+    const fold = folds.get(id) ?? {
+      uncachedInputTokens: 0, cacheReadTokens: 0, outputTokens: 0,
+      usdInput: 0, usdOutput: 0, turns: 0, unpricedTurns: 0,
+    }
+    fold.uncachedInputTokens += buckets.uncachedInputTokens
+    fold.cacheReadTokens += buckets.cacheReadTokens
+    fold.outputTokens += buckets.outputTokens
+    fold.turns += 1
+    const price = priceFor(sessionModels.get(id) ?? currentModel, new Date(time))
+    if (price == null) {
+      fold.unpricedTurns += 1
+    } else {
+      fold.usdInput += (buckets.uncachedInputTokens / 1e6) * price.cacheMiss + (buckets.cacheReadTokens / 1e6) * price.cacheHit
+      fold.usdOutput += (buckets.outputTokens / 1e6) * price.output
+    }
+    folds.set(id, fold)
+  }
+
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
       currentSession = session
+      const id = session?.header?.id ?? session?.id
       if (event?.type === 'request/header') {
         const model = event.data?.header?.config?.model
-        if (typeof model === 'string') currentModel = model
+        if (typeof model === 'string') {
+          currentModel = model
+          if (id != null) sessionModels.set(id, model)
+        }
       }
+      if (event?.type === 'assistant/message') recordTurn(session, event)
     })
     return () => { try { off?.() } catch { /* 已回收 */ } }
   }, 'usage-card: track latest session')
@@ -540,7 +626,8 @@ export function apply(ctx) {
             if (payloadCache.payload !== null && payloadCache.key === key) {
               payload = payloadCache.payload
             } else {
-              payload = buildPayload(ctx, target, currentModel, settings)
+              const targetId = target?.header?.id ?? target?.id ?? null
+              payload = buildPayload(ctx, target, currentModel, settings, targetId == null ? null : folds.get(targetId) ?? null)
               if (payload.ok === true && watermark != null) payloadCache = { key, payload }
             }
           }

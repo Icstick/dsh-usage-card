@@ -82,6 +82,19 @@ await t('枚举失败 → 带 unavailable，不崩、不假装没有子代理', 
   assert.equal(r.count, 0)
   assert.match(r.unavailable, /query down/)
 })
+await t('全部都释放时 → tokens/costCny 为 null，而不是 0（不假装花了 0）', async () => {
+  const onlyGone = {
+    sessions: { get: () => undefined },
+    sessionProjections: { snapshot: () => ({ values: {} }) },
+    sessionQuery: { listSessions: async () => [{ header: { id: 'g1', parentSession: PARENT, delegationDepth: 1 }, live: false }] },
+  }
+  const r = await collect(onlyGone, PARENT, SETTINGS)
+  assert.equal(r.count, 1)
+  assert.equal(r.released, 1)
+  assert.equal(r.tokens, null, '取不到不是 0')
+  assert.equal(r.costCny, null)
+})
+
 await t('没有 parentId → 空结果', async () => {
   const r = await collect(makeCtx(), null, SETTINGS)
   assert.equal(r.count, 0)
