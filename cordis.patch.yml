@@ -1,0 +1,4 @@
+# dsh-usage-card bundle patch：挂载用量卡片插件（宿主半）
+- insert:
+    - id: usage-card
+      name: dsh-usage-card

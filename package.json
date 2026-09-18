@@ -1,0 +1,50 @@
+{
+  "name": "dsh-usage-card",
+  "version": "0.2.0-m2",
+  "description": "Sidebar card for DeepSeek Harness: per-session cost, token buckets, and context share by source.",
+  "keywords": ["dsh", "deepseek-harness", "plugin", "usage", "cost", "token"],
+  "license": "MIT",
+  "author": "Icstick",
+  "repository": { "type": "git", "url": "git+https://github.com/Icstick/dsh-usage-card.git" },
+  "homepage": "https://github.com/Icstick/dsh-usage-card#readme",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": {
+      "default": "./src/index.mjs"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "files": [
+    "src",
+    "lib",
+    "client",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-client-ui-slots": ">=0.1.0-alpha.0 <1.0.0",
+    "@deepseek-ai/dsh-session-projection": ">=0.1.0-rc.8 <0.2.0"
+  },
+  "scripts": {
+    "build:client": "node scripts/build-client.mjs"
+  }
+}

@@ -1,0 +1,208 @@
+{
+  "schemaVersion": 1,
+  "kind": "dsh-usage-tracking.prices",
+  "generatedAt": "2026-09-18",
+  "pricingCurrency": "USD",
+  "priceUnit": "per_1m_tokens",
+  "primarySource": {
+    "url": "https://api-docs.deepseek.com/quick_start/pricing",
+    "title": "Models & Pricing — DeepSeek API Docs",
+    "checkedAt": "2026-09-18"
+  },
+  "supportingSources": [
+    {
+      "url": "https://api-docs.deepseek.com/updates",
+      "title": "DeepSeek API Docs — Updates/News",
+      "checkedAt": "2026-09-18",
+      "usedFor": "峰谷计费生效时间；V4.1-Flash 发布与降价说明；V4-Pro 2026-09-14 后继续服务"
+    }
+  ],
+  "peakPricing": {
+    "enabled": true,
+    "effectiveFrom": "2026-08-16T16:00:00Z",
+    "effectiveFromSourceQuote": "we will adopt peak/off-peak pricing, with off-peak prices set at half of the peak-hour prices ... The new prices will take effect at 16:00 (UTC Time) on August 16, 2026.",
+    "effectiveFromSourceUrl": "https://api-docs.deepseek.com/updates",
+    "timezone": "UTC",
+    "weekdays": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "weekdayConvention": "ISO-8601, Mon=1 .. Sun=7",
+    "windows": [
+      {
+        "start": "01:00",
+        "end": "04:00"
+      },
+      {
+        "start": "06:00",
+        "end": "10:00"
+      }
+    ],
+    "intervalSemantics": "start-inclusive, end-exclusive",
+    "offPeakIsHalfOfPeak": true,
+    "sourceQuote": "Off-peak rates are half of the peak rates. Peak hours are 01:00 - 04:00 and 06:00 - 10:00 UTC, Monday through Friday (all other hours are off-peak).",
+    "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  "bucketMapping": {
+    "note": "DSH tokenUsage 投影四桶 → 官方价目行的映射。四桶互斥，直接相乘相加即可，不需要再做拆分。",
+    "cacheReadTokens": {
+      "officialLine": "1M INPUT TOKENS (CACHE HIT)",
+      "priceField": "cacheHit"
+    },
+    "uncachedInputTokens": {
+      "officialLine": "1M INPUT TOKENS (CACHE MISS)",
+      "priceField": "cacheMiss"
+    },
+    "outputTokens": {
+      "officialLine": "1M OUTPUT TOKENS",
+      "priceField": "output"
+    },
+    "cacheWriteTokens": {
+      "officialLine": null,
+      "priceField": null,
+      "chargedSeparately": false,
+      "evidence": "官方价目仅列三行（cache hit / cache miss / output），未单列缓存写入",
+      "implementationRule": "DeepSeek 路由下 cacheWriteTokens 不单独计价，也不得按 cacheMiss 价重复计费"
+    }
+  },
+  "models": {
+    "deepseek-flash": {
+      "displayName": "DeepSeek-V4.1-Flash",
+      "provider": "deepseek",
+      "modelVersion": "DeepSeek-V4.1-Flash",
+      "currency": "USD",
+      "unit": "per_1m_tokens",
+      "effectiveFrom": "2026-09-10",
+      "effectiveFromPrecision": "date",
+      "effectiveFromNote": "官方 Updates 页 2026-09-10：With the release of DeepSeek-V4.1-Flash, API prices have been reduced accordingly. 未给出具体时刻，故按日期记。",
+      "checkedAt": "2026-09-18",
+      "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing",
+      "offPeak": {
+        "cacheHit": 0.003,
+        "cacheMiss": 0.15,
+        "output": 0.6
+      },
+      "peak": {
+        "cacheHit": 0.006,
+        "cacheMiss": 0.3,
+        "output": 1.2
+      },
+      "cacheWrite": null,
+      "capabilities": {
+        "contextLength": 1000000,
+        "maxOutputTokens": 384000,
+        "concurrencyLimit": 2500,
+        "vision": true,
+        "thinkingDefault": true,
+        "thinkingEfforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "capabilitiesSourceUrl": "https://api-docs.deepseek.com/quick_start/pricing"
+      },
+      "rateHistory": [
+        {
+          "effectiveFrom": "2026-09-10",
+          "changeKind": "price-reduction",
+          "prices": null,
+          "note": "V4.1-Flash 发布同时降价；官方未公布降价前的具体单价，故 prices 记 null（未取到），不猜测。",
+          "sourceUrl": "https://api-docs.deepseek.com/updates"
+        },
+        {
+          "effectiveFrom": "2026-08-16T16:00:00Z",
+          "changeKind": "peak-off-peak-introduced",
+          "prices": null,
+          "note": "峰谷计费开始生效；该时点前后的具体单价官方更新页未列出。",
+          "sourceUrl": "https://api-docs.deepseek.com/updates"
+        }
+      ]
+    },
+    "deepseek-v4-pro": {
+      "displayName": "DeepSeek-V4-Pro-0813",
+      "provider": "deepseek",
+      "modelVersion": "DeepSeek-V4-Pro-0813",
+      "currency": "USD",
+      "unit": "per_1m_tokens",
+      "effectiveFrom": "2026-08-16T16:00:00Z",
+      "effectiveFromPrecision": "timestamp",
+      "effectiveFromNote": "峰谷计费生效时点。官方脚注 (2)：We have decided to continue providing API services for DeepSeek V4 Pro after September 14, 2026, with the billing method remaining unchanged —— 即 2026-09-14 之后单价不变。",
+      "checkedAt": "2026-09-18",
+      "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing",
+      "offPeak": {
+        "cacheHit": 0.022,
+        "cacheMiss": 0.66,
+        "output": 1.98
+      },
+      "peak": {
+        "cacheHit": 0.044,
+        "cacheMiss": 1.32,
+        "output": 3.96
+      },
+      "cacheWrite": null,
+      "capabilities": {
+        "contextLength": 1000000,
+        "maxOutputTokens": 384000,
+        "concurrencyLimit": 500,
+        "vision": false,
+        "thinkingDefault": true,
+        "thinkingEfforts": [
+          "low",
+          "high",
+          "max"
+        ],
+        "capabilitiesSourceUrl": "https://api-docs.deepseek.com/quick_start/pricing"
+      },
+      "rateHistory": [
+        {
+          "effectiveFrom": "2026-09-14",
+          "changeKind": "billing-unchanged-declared",
+          "prices": null,
+          "note": "官方声明 V4 Pro 于 2026-09-14 之后继续服务且计费方式不变。prices 记 null 表示「无变化」，不是「未取到」；消费侧应沿用 2026-08-16 起的单价。",
+          "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing"
+        },
+        {
+          "effectiveFrom": "2026-08-16T16:00:00Z",
+          "changeKind": "peak-off-peak-introduced",
+          "prices": null,
+          "note": "峰谷计费开始生效；该时点前的单价官方更新页未列出。",
+          "sourceUrl": "https://api-docs.deepseek.com/updates"
+        }
+      ]
+    }
+  },
+  "aliases": {
+    "deepseek-v4-flash": {
+      "resolvesTo": "deepseek-flash",
+      "status": "legacy-name-still-accepted-model-retired",
+      "billing": "served by DeepSeek-V4.1-Flash, billed at the Flash price",
+      "since": "2026-09-10",
+      "sourceQuote": "Use deepseek-flash as the model name. The legacy names deepseek-v4-flash and deepseek-v4-flash-vision-exp are still accepted, but the corresponding models have been retired, their requests are served by the DeepSeek-V4.1-Flash model and billed at the Flash price.",
+      "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing"
+    },
+    "deepseek-v4-flash-vision-exp": {
+      "resolvesTo": "deepseek-flash",
+      "status": "legacy-name-still-accepted-model-retired",
+      "billing": "served by DeepSeek-V4.1-Flash, billed at the Flash price",
+      "since": "2026-09-10",
+      "sourceQuote": "同上（脚注 1）",
+      "sourceUrl": "https://api-docs.deepseek.com/quick_start/pricing"
+    }
+  },
+  "unknownModelPolicy": {
+    "price": null,
+    "rule": "查不到模型或查不到对应档位价时返回 null，绝不回退到任何 default 价、也绝不当 0 处理。",
+    "resolverRules": [
+      "1) 先按 aliases 归一化模型名（别名优先于 models 直查），避免退役名命中残留条目",
+      "2) 再查 models[归一化名]",
+      "3) 再按 UTC 时间 + ISO 星期选 offPeak 或 peak 档",
+      "4) 档位对象里字段为 null（未取到）时，该字段视为未定价 → 整体金额返回 null，不得部分计费",
+      "5) 全程不使用本机时区，不用 Date 的本地方法"
+    ]
+  },
+  "fallback": null,
+  "fallbackNote": "本表刻意不提供 default 价格：任何未定价都必须显式暴露为 null，由消费侧显示「未定价」。"
+}
