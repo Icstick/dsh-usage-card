@@ -1,6 +1,6 @@
 {
   "name": "dsh-usage-card",
-  "version": "0.7.0-m5",
+  "version": "0.8.0-m5",
   "description": "Sidebar card for DeepSeek Harness: per-session cost, token buckets, and context share by source.",
   "keywords": ["dsh", "deepseek-harness", "plugin", "usage", "cost", "token"],
   "license": "MIT",
@@ -49,7 +49,7 @@
   },
   "scripts": {
     "build:client": "node scripts/build-client.mjs",
-    "test": "node test/m0-check.mjs && node test/wiring-check.mjs && node test/subagent-check.mjs",
+    "test": "node test/m0-check.mjs && node test/wiring-check.mjs && node test/subagent-check.mjs && node test/report-check.mjs",
     "verify": "node scripts/verify.mjs"
   }
 }

@@ -45,6 +45,17 @@ node scripts/install-local.mjs              # 链接进 web profile（不走 pnp
 node scripts/install-local.mjs --uninstall  # 可逆
 ```
 
+## 导出报告
+
+卡片面板底部有两个入口（也可直接开 URL）：
+
+- `/usage-card/report?format=md` —— Markdown：总览 / 按天 / 按模型 / 按会话 / 计价说明
+- `/usage-card/report?format=csv` —— CSV：一行一个「天 × 模型」
+
+报告**直接读本机会话日志**折叠生成（不落账本库），因此覆盖全部历史会话。本机实测：50 个日志、3242 轮、1.2 秒、0 坏行。
+
+折叠口径与卡片一致：每个轮次按它自己的时刻判峰谷，模型取该轮时点上生效的请求头；未定价轮次单列且不计入金额。
+
 ## 口径纪律（本插件最在意的部分）
 
 1. **实测与估算永不相加。** 四桶来自 provider 上报（实测）；占比是按 surface 逐节点定价的**估算**。两者在接口里就是两组字段，界面分区显示、各带标签。
@@ -75,6 +86,8 @@ node scripts/build-client.mjs   # 改了 client/index.js 必须重建 lib/client
 node test/m0-check.mjs          # 纯函数与 payload 验收
 node test/wiring-check.mjs      # 接线验证（假 ctx 跑 apply）
 node test/subagent-check.mjs    # 子代理归集（实测四桶 + 已释放的诚实处理）
+node test/report-check.mjs      # 报告：多帧解码、逐轮折叠、聚合与渲染
+npm test                        # 以上全部
 node scripts/verify.mjs         # 起服务后自检路由与 payload
 ```
 
@@ -103,8 +116,8 @@ node scripts/verify.mjs         # 起服务后自检路由与 payload
 | M2 | 六类归因（**已并入 M1**） | ✅ |
 | M3 | subagent 归集（子会话四桶，实测） | ✅ |
 | M4 | 设置页（汇率 / 显示开关） | ✅ |
-| M5 | 逐轮账本落盘 + 导出报告 + 汇率自动更新 | |
-| M5 | A/B 机验证 | |
+| M5 | 导出报告（日志折叠，Markdown/CSV） | ✅ |
+| M6 | 逐轮账本落盘 + 汇率自动更新 + A/B 机验证 | |
 
 ## 许可
 

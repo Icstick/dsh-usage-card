@@ -2,7 +2,7 @@
 // dev-lessons 第 21 条的教训：模块级测试全绿但接线从未插入 = 假绿。
 // 这里真的调 apply(ctx)，检验：路由注册到了预期路径、handler 返回可解析的 JSON、事件被跟踪。
 import assert from 'node:assert/strict'
-import { apply, ROUTE, localFenceRejection } from '../src/index.mjs'
+import { apply, ROUTE, REPORT_ROUTE, localFenceRejection } from '../src/index.mjs'
 
 let pass = 0
 // 必须 await：handler 已是 async，断言与取回 body 都要等
@@ -38,18 +38,22 @@ const ctx = {
 
 console.log('接线')
 await t('apply 可调用且不抛', () => apply(ctx))
-await t('路由注册到预期路径（exact）', () => {
-  assert.equal(registered.length, 1)
-  assert.equal(registered[0].path, ROUTE)
-  assert.equal(registered[0].kind, 'exact')
-  assert.equal(typeof registered[0].handler, 'function')
+await t('两条只读路由都注册了（卡片 + 报告）', () => {
+  assert.equal(registered.length, 2)
+  for (const path of [ROUTE, REPORT_ROUTE]) {
+    const route = registered.find((r) => r.path === path)
+    assert.ok(route, '缺路由 ' + path)
+    assert.equal(route.kind, 'exact')
+    assert.equal(typeof route.handler, 'function')
+  }
 })
 await t('订阅了 session/event', () => assert.ok(listeners.has('session/event')))
 
 await t('注册了可回收的 effect（卸载不泄漏）', () => assert.ok(effects.length >= 2 && effects.every((f) => typeof f === 'function')))
 
 console.log('路由行为')
-const handler = registered[0].handler
+// 按路径取，不依赖注册顺序
+const handler = registered.find((r) => r.path === ROUTE).handler
 async function call(url = ROUTE, init = {}) {
   let body = ''
   const res = {

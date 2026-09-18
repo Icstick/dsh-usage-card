@@ -12,6 +12,7 @@
  */
 import { readFileSync } from 'node:fs'
 import z from '@deepseek-ai/schemastery'
+import { buildReport, foldSession, listSessionLogs, readSessionLog, renderCsv, renderMarkdown } from './report.mjs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -41,6 +42,9 @@ export const SETTINGS_DEFAULTS = { fxRate: 7.2, showAmount: true, showAttributio
 
 /** 卡片轮询的只读路由。 */
 export const ROUTE = '/usage-card/current.json'
+
+/** 报告导出路由（Markdown / CSV）。 */
+export const REPORT_ROUTE = '/usage-card/report'
 
 /**
  * 宿主的 connection 服务（请求信任栅栏）。
@@ -758,4 +762,73 @@ export function apply(ctx) {
     })
     return () => { try { dispose?.() } catch { /* 已回收 */ } }
   }, 'usage-card: read-only route')
+
+  /** 报告缓存：要读遍所有会话日志（本机 49 个），30 秒内复用。 */
+  let reportCache = { at: 0, key: null, body: null, contentType: null }
+
+  /**
+   * 现算一份报告。单个日志读失败只跳过那一个会话，不让整份报告挂掉。
+   * @param format - 'md' | 'csv'
+   * @param settings - 已解析的设置
+   */
+  const reportFor = (format, settings) => {
+    const key = format + '|' + settings.fxRate
+    const now = Date.now()
+    if (reportCache.body !== null && reportCache.key === key && now - reportCache.at < 30000) return reportCache
+    const logs = listSessionLogs()
+    const sessions = []
+    let failed = 0
+    for (const path of logs) {
+      try {
+        const { events } = readSessionLog(path)
+        const id = String(path).replace(/\\/g, '/').split('/').slice(-2)[0]
+        const folded = foldSession(events, { priceFor, sessionId: id })
+        if (folded.turns > 0) sessions.push(folded)
+      } catch {
+        failed += 1
+      }
+    }
+    const report = buildReport(sessions, {
+      fxRate: settings.fxRate,
+      generatedAt: new Date().toISOString(),
+      priceVersion: PRICES.generatedAt ?? null,
+      covers: logs.length - failed,
+    })
+    const body = format === 'csv' ? renderCsv(report) : renderMarkdown(report)
+    const contentType = format === 'csv' ? 'text/csv; charset=utf-8' : 'text/markdown; charset=utf-8'
+    reportCache = { at: now, key, body, contentType }
+    return reportCache
+  }
+
+  ctx.effect(() => {
+    const dispose = ctx.webServer.register({
+      kind: 'exact',
+      path: REPORT_ROUTE,
+      handler: (req, res) => {
+        if (rejectedByFence(ctx, req, res)) return
+        if (req.method !== 'GET') {
+          res.statusCode = 405
+          res.setHeader('allow', 'GET')
+          res.end()
+          return
+        }
+        try {
+          const query = String(req.url ?? '').indexOf('?') < 0 ? '' : String(req.url).slice(String(req.url).indexOf('?') + 1)
+          const format = new URLSearchParams(query).get('format') === 'csv' ? 'csv' : 'md'
+          const { body, contentType } = reportFor(format, readSettings())
+          const stamp = new Date().toISOString().slice(0, 10)
+          res.statusCode = 200
+          res.setHeader('content-type', contentType)
+          res.setHeader('cache-control', 'no-store')
+          res.setHeader('content-disposition', 'attachment; filename="dsh-usage-report-' + stamp + '.' + format + '"')
+          res.end(body)
+        } catch (error) {
+          res.statusCode = 500
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ ok: false, reason: 'REPORT_FAILED', detail: String(error?.message ?? error).slice(0, 200) }))
+        }
+      },
+    })
+    return () => { try { dispose?.() } catch { /* 已回收 */ } }
+  }, 'usage-card: report route')
 }

@@ -199,6 +199,10 @@ function Card(props) {
         ? h('div', { style: { ...muted, marginTop: '6px' } }, attr.pending || ('退回内核三元：' + attr.fallbackReason))
         : null),
 
+    h('div', { style: { borderTop: '1px solid ' + HAIRLINE, marginTop: '8px', paddingTop: '7px', display: 'flex', gap: '12px', fontSize: '11px', color: MUTED } },
+      h('a', { href: '/usage-card/report?format=md', target: '_blank', rel: 'noreferrer', style: { color: 'inherit' } }, '导出报告 Markdown'),
+      h('a', { href: '/usage-card/report?format=csv', target: '_blank', rel: 'noreferrer', style: { color: 'inherit' } }, 'CSV')),
+
     (data.subagents && (data.subagents.count > 0 || data.subagents.unavailable)) ? h('div', { style: { borderTop: '1px solid ' + HAIRLINE, marginTop: '8px', paddingTop: '7px' } },
       h('div', { style: rowStyle },
         h('span', { style: muted },
