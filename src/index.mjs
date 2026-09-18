@@ -764,7 +764,9 @@ export function apply(ctx) {
   }, 'usage-card: read-only route')
 
   /** 报告缓存：要读遍所有会话日志（本机 49 个），30 秒内复用。 */
-  let reportCache = { at: 0, key: null, body: null, contentType: null }
+  // 按「格式|汇率」分别缓存：点完 md 再点 csv 不该把前者顶掉（单槽位会让第二次白等 1.4 s）
+  const reportCache = new Map()
+  const REPORT_TTL_MS = 30000
 
   /**
    * 现算一份报告。单个日志读失败只跳过那一个会话，不让整份报告挂掉。
@@ -774,7 +776,8 @@ export function apply(ctx) {
   const reportFor = (format, settings) => {
     const key = format + '|' + settings.fxRate
     const now = Date.now()
-    if (reportCache.body !== null && reportCache.key === key && now - reportCache.at < 30000) return reportCache
+    const cached = reportCache.get(key)
+    if (cached !== undefined && now - cached.at < REPORT_TTL_MS) return cached
     const logs = listSessionLogs()
     const sessions = []
     let failed = 0
@@ -796,8 +799,9 @@ export function apply(ctx) {
     })
     const body = format === 'csv' ? renderCsv(report) : renderMarkdown(report)
     const contentType = format === 'csv' ? 'text/csv; charset=utf-8' : 'text/markdown; charset=utf-8'
-    reportCache = { at: now, key, body, contentType }
-    return reportCache
+    const entry = { at: now, body, contentType }
+    reportCache.set(key, entry)
+    return entry
   }
 
   ctx.effect(() => {
