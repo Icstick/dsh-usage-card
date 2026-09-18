@@ -37,6 +37,7 @@
     "lib",
     "client",
     "scripts",
+    "test",
     "cordis.patch.yml",
     "README.md"
   ],

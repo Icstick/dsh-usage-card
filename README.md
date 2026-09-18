@@ -38,6 +38,26 @@ dsh plugin --profile web add github:Icstick/dsh-usage-card
 
 装完**重启 `dsh web`**，刷新页面。卡片出现在左侧栏「设置」正上方。
 
+**不需要构建步骤**：`lib/client.js` 随包发布（用 `npm pack --dry-run` 校验过产物里确实含有它）。
+
+## 多机安装
+
+在每台目标机上跑同一条命令即可：
+
+```powershell
+dsh plugin --profile web add github:Icstick/dsh-usage-card
+```
+
+要在多台机器上批量装，用 `scripts/install-usage-card.ps1`（装 → **校验** → 提示重启）。它既能就地运行，也能让已有的 `run-on.ps1` 经 ssh 推到目标机执行：
+
+```powershell
+pwsh -File run-on.ps1 -Script .\install-usage-card.ps1 -Target b-server
+```
+
+脚本会校验三件事——包在 `dependencies`、在 `bundles`、`lib/client.js` 存在。**"装完了但其实没生效"比装失败更难查**，所以这一步不能省。
+
+> 本插件的账本是**每台机器各管自己**：各自读自己的会话日志，不跨机合并。
+
 本地开发 / 离线安装：
 
 ```powershell
