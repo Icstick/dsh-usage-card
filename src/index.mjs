@@ -42,6 +42,42 @@ export const SETTINGS_DEFAULTS = { fxRate: 7.2, showAmount: true, showAttributio
 /** 卡片轮询的只读路由。 */
 export const ROUTE = '/usage-card/current.json'
 
+/**
+ * 宿主的 connection 服务（请求信任栅栏）。
+ *
+ * 它提供 Host/Origin 校验（挡 DNS rebinding 与跨站调用）与浏览器认证；
+ * **插件路由必须自己过这道栅栏** —— webServer 只负责派发，不做认证。
+ * 不写进 inject：该包是浏览器侧的，强行注入会让 fiber 永远 pending；
+ * 官方同款做法也是运行时取（open-in-app/src/index.ts:84）。
+ * @param ctx - 宿主上下文
+ */
+function connectionOf(ctx) {
+  return Reflect.get(ctx, 'connection')
+}
+
+/**
+ * 未通过栅栏就拒绝。**fail closed**：取不到栅栏时一律 403，绝不 fail open。
+ * @param ctx - 宿主上下文
+ * @param req - 传入请求
+ * @param res - 传出响应
+ * @returns true 表示已拒绝并结束响应
+ */
+export function rejectedByFence(ctx, req, res) {
+  let status
+  try {
+    const connection = connectionOf(ctx)
+    status = connection == null || typeof connection.requestRejection !== 'function'
+      ? 403
+      : connection.requestRejection(req)
+  } catch {
+    status = 403
+  }
+  if (status === undefined) return false
+  res.statusCode = status
+  res.end()
+  return true
+}
+
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PRICES = JSON.parse(readFileSync(join(HERE, 'prices.json'), 'utf8'))
 /** 本插件版本；写进 payload 便于一眼看出宿主跑的哪个构建。 */
@@ -220,11 +256,27 @@ function measuredUsageOf(ctx, session) {
  * @param parentId - 本会话 id
  * @param settings - 已解析的设置
  */
+/** 会话枚举缓存：listSessions() 是全量磁盘扫描（实测 49 个会话 mean 19.85 ms），
+ * 而子代理集合变化很慢 —— 缓存列表，但每个子会话的投影仍然实时读，数字不会滞后。 */
+const LIST_TTL_MS = 4000
+let listCache = { at: 0, records: null }
+
+/** 清掉枚举缓存（测试与卸载用）。 */
+export function resetSubagentCache() {
+  listCache = { at: 0, records: null }
+}
+
 export async function collectSubagents(ctx, parentId, settings) {
   if (parentId == null) return { count: 0, measured: 0, released: 0, tokens: null, costCny: null, items: [], includedInTotal: false }
   let records
   try {
-    records = await ctx.sessionQuery.listSessions()
+    const now = Date.now()
+    if (listCache.records !== null && now - listCache.at < LIST_TTL_MS) {
+      records = listCache.records
+    } else {
+      records = await ctx.sessionQuery.listSessions()
+      listCache = { at: now, records }
+    }
   } catch (error) {
     return { count: 0, measured: 0, released: 0, tokens: null, costCny: null, items: [], includedInTotal: false, unavailable: String(error?.message ?? error).slice(0, 120) }
   }
@@ -413,10 +465,21 @@ export function apply(ctx) {
 
   /** 现读设置 —— 设置服务 applies 默认 'live'，保存后无需重启。 */
   const readSettings = () => {
+    let raw
     try {
-      return settingsScope === null ? SETTINGS_DEFAULTS : settingsScope.get()
+      raw = settingsScope === null ? SETTINGS_DEFAULTS : settingsScope.get()
     } catch {
       return SETTINGS_DEFAULTS
+    }
+    // 防御：手改 settings.yaml 可以塞进 NaN / null / 负数，schema 层不一定挡住。
+    // 汇率非法就退回默认值 —— 否则金额会静默变成 ¥0.00（比报错更危险）。
+    const rate = Number(raw?.fxRate)
+    return {
+      ...SETTINGS_DEFAULTS,
+      ...raw,
+      fxRate: Number.isFinite(rate) && rate > 0 ? rate : SETTINGS_DEFAULTS.fxRate,
+      showAmount: raw?.showAmount !== false,
+      showAttribution: raw?.showAttribution !== false,
     }
   }
 
@@ -436,23 +499,50 @@ export function apply(ctx) {
     return () => { try { off?.() } catch { /* 已回收 */ } }
   }, 'usage-card: track latest session')
 
+  /** payload 缓存：键 = 会话 + 投影水位 + 设置。asOfSeq 不变就不必重算 measure()（O(surface)）。 */
+  let payloadCache = { key: null, payload: null }
+
   ctx.effect(() => {
     const dispose = ctx.webServer.register({
       kind: 'exact',
       path: ROUTE,
       handler: async (req, res) => {
+        // 1) 先过宿主的信任栅栏（Host/Origin + 浏览器认证）—— 这一步在任何数据处理之前
+        if (rejectedByFence(ctx, req, res)) return
+        // 2) 方法白名单：只有 GET
+        if (req.method !== 'GET') {
+          res.statusCode = 405
+          res.setHeader('allow', 'GET')
+          res.end()
+          return
+        }
         let payload
         try {
           const requested = sessionIdFrom(req.url)
           const settings = readSettings()
-          if (requested == null) {
-            payload = buildPayload(ctx, currentSession, currentModel, settings)
-          } else {
-            const resolved = ctx.sessions.get(requested)
+          const target = requested == null ? currentSession : ctx.sessions.get(requested)
+          if (requested != null && target === undefined) {
             // 解析不到就诚实说「该会话未加载」，绝不悄悄显示另一个会话的数字
-            payload = resolved === undefined
-              ? { ok: false, schemaVersion: 1, reason: 'SESSION_NOT_LOADED', session: { id: requested } }
-              : buildPayload(ctx, resolved, currentModel, settings)
+            payload = { ok: false, schemaVersion: 1, reason: 'SESSION_NOT_LOADED', session: { id: requested } }
+          } else {
+            // 水位取不到（投影服务异常）就退化为不缓存，仍然返回正确数据
+            let watermark = null
+            try {
+              watermark = target == null ? null : ctx.sessionProjections.snapshot(target).asOfSeq
+            } catch {
+              watermark = null
+            }
+            const key = [
+              target?.header?.id ?? target?.id ?? 'none',
+              watermark ?? 'no-watermark',
+              settings.fxRate, settings.showAmount, settings.showAttribution,
+            ].join('|')
+            if (payloadCache.payload !== null && payloadCache.key === key) {
+              payload = payloadCache.payload
+            } else {
+              payload = buildPayload(ctx, target, currentModel, settings)
+              if (payload.ok === true && watermark != null) payloadCache = { key, payload }
+            }
           }
           // 子代理归集是异步的（要枚举会话），失败不影响主卡片
           if (payload.ok === true && payload.session?.id != null) {

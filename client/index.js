@@ -11,6 +11,8 @@ const { createElement: h, useState, useEffect, useSyncExternalStore } = require(
 
 const ROUTE = '/usage-card/current.json'
 const POLL_MS = 3000
+/** 单次请求超时：超了就报错重试，不要让卡片冻在旧数据上。 */
+const FETCH_TIMEOUT_MS = 8000
 
 // 侧栏槽位（sidebar.footer.action）只拿到 { wide }，没有会话上下文；而
 // conversation.composer.dock 是 session 作用域槽位，运行时 props 带会话身份。
@@ -53,11 +55,18 @@ function usePayload() {
     let timer = null
     const tick = () => {
       const url = ACTIVE_SESSION ? ROUTE + '?session=' + encodeURIComponent(ACTIVE_SESSION) : ROUTE
-      fetch(url, { cache: 'no-store' })
-        .then((res) => res.json())
+      // 超时是必须的：没有它，一次挂起的请求会让 timer 永不被赋值，
+      // 卡片就冻在旧数据上且不报错 —— 静默失效比报错更糟。
+      const ctl = typeof AbortController === 'function' ? new AbortController() : null
+      const timeout = setTimeout(() => { if (ctl) ctl.abort() }, FETCH_TIMEOUT_MS)
+      fetch(url, { cache: 'no-store', signal: ctl ? ctl.signal : undefined })
+        .then((res) => {
+          if (!res.ok) throw new Error('HTTP ' + res.status)
+          return res.json()
+        })
         .then((data) => { if (alive) setState({ loading: false, data }) })
         .catch((error) => { if (alive) setState({ loading: false, error: String((error && error.message) || error) }) })
-        .then(() => { if (alive) timer = setTimeout(tick, POLL_MS) })
+        .then(() => { clearTimeout(timeout); if (alive) timer = setTimeout(tick, POLL_MS) })
     }
     tick()
     return () => { alive = false; if (timer) clearTimeout(timer) }
