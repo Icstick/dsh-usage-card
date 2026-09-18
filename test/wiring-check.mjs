@@ -27,6 +27,8 @@ const ctx = {
     }),
   },
   // 事件与生命周期
+  // settings 接缝：注册后返回作用域，可读取
+  settings: { register: () => ({ get: () => ({ fxRate: 7.2, showAmount: true, showAttribution: true }) }) },
   on: (name, fn) => { listeners.set(name, fn); return () => { listeners.delete(name) } },
   effect: (fn) => { const d = fn(); if (typeof d === 'function') effects.push(d) },
 }
@@ -40,6 +42,7 @@ t('路由注册到预期路径（exact）', () => {
   assert.equal(typeof registered[0].handler, 'function')
 })
 t('订阅了 session/event', () => assert.ok(listeners.has('session/event')))
+
 t('注册了可回收的 effect（卸载不泄漏）', () => assert.ok(effects.length >= 2 && effects.every((f) => typeof f === 'function')))
 
 console.log('路由行为')
@@ -121,6 +124,18 @@ t('会话解析不到 → SESSION_NOT_LOADED（不显示别人的数字）', () 
   assert.equal(p.ok, false)
   assert.equal(p.reason, 'SESSION_NOT_LOADED')
   assert.equal(p.measured, undefined)
+})
+
+console.log('设置接缝')
+// 注意：探针必须在最后跑 —— 它复用了同一个 listeners Map，会把前面实例的监听器顶掉
+t('注册了设置命名空间（供设置页读写）', () => {
+  let registeredNs = null
+  const probe = {
+    ...ctx,
+    settings: { register: (ns) => { registeredNs = ns; return { get: () => ({ fxRate: 7.2, showAmount: true, showAttribution: true }) } } },
+  }
+  apply(probe)
+  assert.equal(registeredNs, 'dsh-usage-card')
 })
 
 console.log('\n接线全部通过：' + pass + ' 项')

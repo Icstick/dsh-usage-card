@@ -11,13 +11,33 @@
  * @module dsh-usage-card
  */
 import { readFileSync } from 'node:fs'
+import z from '@deepseek-ai/schemastery'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 /** Cordis 插件名。 */
 export const name = 'usage-card'
 /** 依赖的服务；缺任一则 fiber 保持 pending，不会半死。sessions 用于按 id 解析客户端正在看的会话。 */
-export const inject = ['webServer', 'sessionProjections', 'sessions', 'tokenMeter']
+export const inject = ['webServer', 'sessionProjections', 'sessions', 'tokenMeter', 'settings']
+
+/** 设置页 namespace；与客户端设置卡片必须一致。 */
+export const SETTINGS_NAMESPACE = 'dsh-usage-card'
+
+/**
+ * 设置页 schema。三个键都是「用户层覆盖」语义：
+ * 留空则用 schema 默认值（与设计文稿一致的做法）。
+ */
+export const SETTINGS_SCHEMA = z.object({
+  /** 展示汇率：美元 → 人民币。默认 7.2，用户可改。 */
+  fxRate: z.number().min(0.01).max(1000).default(7.2),
+  /** 是否在卡片上显示金额。与其它显示金额的插件同屏时可关掉。 */
+  showAmount: z.boolean().default(true),
+  /** 是否显示上下文占比这一整块。 */
+  showAttribution: z.boolean().default(true),
+})
+
+/** 设置缺省值（scope 不可用时的兜底，与 schema 默认一致）。 */
+export const SETTINGS_DEFAULTS = { fxRate: 7.2, showAmount: true, showAttribution: true }
 
 /** 卡片轮询的只读路由。 */
 export const ROUTE = '/usage-card/current.json'
@@ -165,9 +185,17 @@ export function attribute(ctx, session, toolsTokens) {
   return { acc, total, logRevision: measurement.logRevision }
 }
 
-/** 当前汇率快照。M0 用手动兜底值；M4 接自动更新。 */
-function fxSnapshot() {
-  return { rate: 7.2, source: 'manual-fallback', at: new Date().toISOString(), status: 'fallback' }
+/**
+ * 当前汇率快照。取自设置页的 fxRate；M4 接自动更新（拉取失败再退回这里的手动值）。
+ * @param settings - 已解析的设置值
+ */
+function fxSnapshot(settings) {
+  return {
+    rate: settings.fxRate,
+    source: 'settings',
+    at: new Date().toISOString(),
+    status: 'manual',
+  }
 }
 
 /**
@@ -176,7 +204,14 @@ function fxSnapshot() {
  * @param session - 最近有事件的会话
  * @param model - 最近一次请求的模型名
  */
-export function buildPayload(ctx, session, model) {
+/**
+ * 组装卡片 payload。
+ * @param ctx - 携带 sessionProjections / tokenMeter 的上下文
+ * @param session - 目标会话
+ * @param model - 事件跟踪到的模型（仅作 modelSelection 缺席时的兜底）
+ * @param settings - 已解析的设置值（默认与 schema 默认一致）
+ */
+export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS) {
   const base = {
     ok: true,
     schemaVersion: 1,
@@ -206,7 +241,7 @@ export function buildPayload(ctx, session, model) {
   }
   const billed = buckets.uncachedInputTokens + buckets.cacheReadTokens + buckets.outputTokens
   const price = priceFor(effectiveModel, new Date())
-  const fx = fxSnapshot()
+  const fx = fxSnapshot(settings)
   const cost = computeCost(buckets, price, fx.rate)
   const denom = buckets.cacheReadTokens + buckets.uncachedInputTokens
   const breakdown = values.contextBreakdown
@@ -271,6 +306,7 @@ export function buildPayload(ctx, session, model) {
       fx,
       priceVersion: PRICES.generatedAt ?? null,
     },
+    display: { showAmount: settings.showAmount, showAttribution: settings.showAttribution },
     attribution,
     subagents: { count: 0, tokens: null, costCny: null, includedInTotal: false, items: [], pending: 'M3' },
   }
@@ -284,6 +320,22 @@ export function buildPayload(ctx, session, model) {
 export function apply(ctx) {
   let currentSession = null
   let currentModel = null
+  /** 设置作用域；注册在 effect 上，卸载即回收。 */
+  let settingsScope = null
+
+  /** 现读设置 —— 设置服务 applies 默认 'live'，保存后无需重启。 */
+  const readSettings = () => {
+    try {
+      return settingsScope === null ? SETTINGS_DEFAULTS : settingsScope.get()
+    } catch {
+      return SETTINGS_DEFAULTS
+    }
+  }
+
+  ctx.effect(() => {
+    settingsScope = ctx.settings.register(SETTINGS_NAMESPACE, SETTINGS_SCHEMA)
+    return () => { settingsScope = null }
+  }, 'usage-card: settings')
 
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
@@ -305,13 +357,13 @@ export function apply(ctx) {
         try {
           const requested = sessionIdFrom(req.url)
           if (requested == null) {
-            payload = buildPayload(ctx, currentSession, currentModel)
+            payload = buildPayload(ctx, currentSession, currentModel, readSettings())
           } else {
             const resolved = ctx.sessions.get(requested)
             // 解析不到就诚实说「该会话未加载」，绝不悄悄显示另一个会话的数字
             payload = resolved === undefined
               ? { ok: false, schemaVersion: 1, reason: 'SESSION_NOT_LOADED', session: { id: requested } }
-              : buildPayload(ctx, resolved, currentModel)
+              : buildPayload(ctx, resolved, currentModel, readSettings())
           }
         } catch (error) {
           payload = { ok: false, reason: 'INTERNAL', detail: String(error?.message ?? error).slice(0, 200) }
