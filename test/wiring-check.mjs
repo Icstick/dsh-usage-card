@@ -2,7 +2,7 @@
 // dev-lessons 第 21 条的教训：模块级测试全绿但接线从未插入 = 假绿。
 // 这里真的调 apply(ctx)，检验：路由注册到了预期路径、handler 返回可解析的 JSON、事件被跟踪。
 import assert from 'node:assert/strict'
-import { apply, ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SYNC_FX_ROUTE, localFenceRejection } from '../src/index.mjs'
+import { apply, ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SYNC_FX_ROUTE, SYNC_PRICES_ROUTE, localFenceRejection } from '../src/index.mjs'
 
 let pass = 0
 // 必须 await：handler 已是 async，断言与取回 body 都要等
@@ -38,9 +38,9 @@ const ctx = {
 
 console.log('接线')
 await t('apply 可调用且不抛', () => apply(ctx))
-await t('四条路由都注册了（卡片 + 报告 + 会话列表 + 汇率同步）', () => {
-  assert.equal(registered.length, 4)
-  for (const path of [ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SYNC_FX_ROUTE]) {
+await t('五条路由都注册了（卡片 + 报告 + 会话列表 + 汇率同步 + 价目同步）', () => {
+  assert.equal(registered.length, 5)
+  for (const path of [ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SYNC_FX_ROUTE, SYNC_PRICES_ROUTE]) {
     const route = registered.find((r) => r.path === path)
     assert.ok(route, '缺路由 ' + path)
     assert.equal(route.kind, 'exact')

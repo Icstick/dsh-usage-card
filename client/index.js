@@ -277,6 +277,16 @@ function makeSettingsSection(scope) {
     const [withSubagents, setWithSubagents] = useState(false)
     const [syncing, setSyncing] = useState(false)
     const [syncMsg, setSyncMsg] = useState(null)
+    const [prices, setPrices] = useState(null)
+    const [priceSyncing, setPriceSyncing] = useState(false)
+    const [priceMsg, setPriceMsg] = useState(null)
+    const loadPrices = () => {
+      fetch('/usage-card/sync-prices', { cache: 'no-store' })
+        .then((r) => r.json())
+        .then((d) => { setPrices(d && d.ok ? d : null) })
+        .catch(() => setPrices(null))
+    }
+    useEffect(() => { loadPrices() }, [])
     useEffect(() => {
       let alive = true
       setSessions(null)
@@ -364,6 +374,43 @@ function makeSettingsSection(scope) {
       }),
 
       syncMsg === null ? null : h('p', { style: { ...label, margin: '0 0 6px' } }, syncMsg),
+
+      // ---- 费用（价目）----
+      h('div', { style: { marginTop: '12px', paddingTop: '10px', borderTop: '1px solid ' + HAIRLINE } },
+        h('div', { style: { display: 'flex', alignItems: 'baseline', gap: '8px' } },
+          h('span', { style: { fontSize: '12px', fontWeight: 600 } }, '费用价目'),
+          h('span', { style: label },
+            prices === null ? '读取中…'
+              : (prices.source === 'bundled' ? '内置价表' : '官方同步') + ' · ' + (prices.checkedAt || '-'))),
+        h('p', { style: { ...label, margin: '4px 0 8px' } }, '单价为 美元/百万 token，顺序：缓存命中 / 未命中 / 输出。峰价 = 谷价 ×2。'),
+
+        prices === null ? null : h('div', { style: { border: '1px solid ' + HAIRLINE, borderRadius: '6px', padding: '6px 8px' } },
+          Object.keys(prices.models).map((name) => h('div', { key: name, style: { fontSize: '11px', lineHeight: 1.7 } },
+            h('span', { style: { fontWeight: 600 } }, name),
+            h('span', { style: { ...label, marginLeft: '8px' } },
+              '谷 ' + prices.models[name].offPeak.cacheHit + ' / ' + prices.models[name].offPeak.cacheMiss + ' / ' + prices.models[name].offPeak.output
+              + (prices.models[name].peak ? '　峰 ' + prices.models[name].peak.cacheHit + ' / ' + prices.models[name].peak.cacheMiss + ' / ' + prices.models[name].peak.output : '　峰 -'))))),
+
+        h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginTop: '8px', flexWrap: 'wrap' } },
+          h('button', {
+            type: 'button', disabled: !writable || priceSyncing,
+            style: { ...input, width: 'auto', cursor: 'pointer' },
+            title: '从 DeepSeek 官方定价页抓取当前价目（含峰谷），解析结果不合理则不落盘',
+            onClick: () => {
+              setPriceSyncing(true)
+              setPriceMsg(null)
+              fetch('/usage-card/sync-prices', { method: 'POST' })
+                .then((r) => r.json())
+                .then((d) => {
+                  setPriceSyncing(false)
+                  if (d && d.ok) { setPriceMsg('已同步 ' + d.models.join(', ') + '（' + d.checkedAt + '）'); loadPrices() }
+                  else setPriceMsg('同步失败：' + ((d && d.reason) || '未知') + (d && d.detail ? '（' + d.detail + '）' : ''))
+                })
+                .catch((e) => { setPriceSyncing(false); setPriceMsg('同步失败：' + String((e && e.message) || e)) })
+            },
+          }, priceSyncing ? '同步中…' : '同步官方价目'),
+          h('a', { href: prices === null ? '#' : prices.url, target: '_blank', rel: 'noreferrer', style: { ...label, textDecoration: 'none' } }, '打开官方定价页')),
+        priceMsg === null ? null : h('p', { style: { ...label, margin: '6px 0 0' } }, priceMsg)),
 
       // ---- 导出报告 ----
       h('div', { style: { marginTop: '12px', paddingTop: '10px', borderTop: '1px solid ' + HAIRLINE } },

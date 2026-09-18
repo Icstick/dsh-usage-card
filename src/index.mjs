@@ -10,9 +10,11 @@
  *
  * @module dsh-usage-card
  */
-import { readFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { buildReport, foldSession, listSessionLogs, readSessionLog, renderCsv, renderMarkdown, userSessions } from './report.mjs'
+import { acceptParsed, OFFICIAL_PRICING_URL, parseOfficialPricing } from './prices-sync.mjs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -51,6 +53,26 @@ export const SESSIONS_ROUTE = '/usage-card/sessions'
 
 /** 汇率同步路由（手动触发）。 */
 export const SYNC_FX_ROUTE = '/usage-card/sync-fx'
+
+/** 官方价目同步路由（手动触发）。 */
+export const SYNC_PRICES_ROUTE = '/usage-card/sync-prices'
+
+/** 同步下来的价目覆盖文件（放在 storages 下，不动包内文件）。 */
+export function priceOverridePath(home = process.env.DSH_HOME ?? join(homedir(), '.dsh')) {
+  return join(home, 'storages', 'dsh-usage-card', 'prices-override.json')
+}
+
+/**
+ * 读价目覆盖文件。读不到就返回 null（用内置价表），不抛。
+ * @param home - DSH 家目录
+ */
+export function loadPriceOverride(home) {
+  try {
+    return JSON.parse(readFileSync(priceOverridePath(home), 'utf8'))
+  } catch {
+    return null
+  }
+}
 
 /** 汇率来源，按顺序试，第一个成功的胜出（实测本机三个都可达）。 */
 export const FX_SOURCES = [
@@ -162,6 +184,9 @@ const PRICES = JSON.parse(readFileSync(join(HERE, 'prices.json'), 'utf8'))
 /** 本插件版本；写进 payload 便于一眼看出宿主跑的哪个构建。 */
 const PLUGIN_VERSION = JSON.parse(readFileSync(join(HERE, '..', 'package.json'), 'utf8')).version
 
+/** 生效中的价目覆盖（同步成功后替换；为 null 时用内置价表）。 */
+let priceOverride = loadPriceOverride()
+
 /**
  * 按 UTC + ISO 星期判定是否峰时。
  * 只用 getUTC* 系列：三台机器时区不同，用本机时间会算出不同的峰谷结论。
@@ -187,7 +212,8 @@ export function isPeak(date, cfg) {
  */
 export function priceFor(model, date) {
   const canonical = PRICES.aliases?.[model]?.resolvesTo ?? model
-  const row = PRICES.models[canonical]
+  // 同步下来的官方价目优先于内置表；两者都没有 → 未定价（不回退默认价）
+  const row = priceOverride?.models?.[canonical] ?? PRICES.models[canonical]
   if (!row) return null
   const peak = isPeak(date, PRICES.peakPricing)
   const tier = peak ? row.peak : row.offPeak
@@ -981,4 +1007,69 @@ export function apply(ctx) {
     })
     return () => { try { dispose?.() } catch { /* 已回收 */ } }
   }, 'usage-card: sync-fx route')
+
+  ctx.effect(() => {
+    const dispose = ctx.webServer.register({
+      kind: 'exact',
+      path: SYNC_PRICES_ROUTE,
+      handler: async (req, res) => {
+        if (rejectedByFence(ctx, req, res)) return
+        res.setHeader('content-type', 'application/json; charset=utf-8')
+        res.setHeader('cache-control', 'no-store')
+        // GET = 读当前生效价目；POST = 去官方页同步
+        const effective = {}
+        for (const [name, row] of Object.entries(priceOverride?.models ?? PRICES.models ?? {})) {
+          effective[name] = { offPeak: row.offPeak ?? row, peak: row.peak ?? null }
+        }
+        if (req.method === 'GET') {
+          res.statusCode = 200
+          res.end(JSON.stringify({
+            ok: true,
+            source: priceOverride === null ? 'bundled' : 'official-sync',
+            checkedAt: priceOverride?.checkedAt ?? PRICES.generatedAt ?? null,
+            url: OFFICIAL_PRICING_URL,
+            models: effective,
+          }))
+          return
+        }
+        if (req.method !== 'POST') {
+          res.statusCode = 405
+          res.setHeader('allow', 'GET, POST')
+          res.end()
+          return
+        }
+        try {
+          const controller = new AbortController()
+          const timer = setTimeout(() => controller.abort(), 15000)
+          const page = await fetch(OFFICIAL_PRICING_URL, { signal: controller.signal })
+          clearTimeout(timer)
+          if (!page.ok) {
+            res.statusCode = 502
+            res.end(JSON.stringify({ ok: false, reason: 'FETCH_FAILED', detail: 'HTTP ' + page.status }))
+            return
+          }
+          const html = await page.text()
+          const text = html.replace(/<script[\s\S]*?<\/script>/g, ' ').replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, ' ')
+          const parsed = parseOfficialPricing(text)
+          const verdict = acceptParsed(parsed, PRICES)
+          if (!verdict.ok) {
+            // 解析结果不合理就不落盘 —— 宁可继续用旧价，也不要拿半截价目算钱
+            res.statusCode = 422
+            res.end(JSON.stringify({ ok: false, reason: verdict.reason, detail: verdict.detail ?? null }))
+            return
+          }
+          const path = priceOverridePath()
+          mkdirSync(dirname(path), { recursive: true })
+          writeFileSync(path, JSON.stringify(parsed, null, 2) + '\n')
+          priceOverride = parsed
+          res.statusCode = 200
+          res.end(JSON.stringify({ ok: true, models: Object.keys(parsed.models), checkedAt: parsed.checkedAt, url: OFFICIAL_PRICING_URL }))
+        } catch (error) {
+          res.statusCode = 500
+          res.end(JSON.stringify({ ok: false, reason: 'SYNC_FAILED', detail: String(error?.message ?? error).slice(0, 160) }))
+        }
+      },
+    })
+    return () => { try { dispose?.() } catch { /* 已回收 */ } }
+  }, 'usage-card: sync-prices route')
 }
