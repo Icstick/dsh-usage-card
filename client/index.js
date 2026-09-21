@@ -202,6 +202,11 @@ function Card(props) {
   const c = data.cost
   const attr = data.attribution
   const rows = attr && Array.isArray(attr.rows) ? attr.rows : []
+  // 三段折叠（Q1=B）：头部与四桶常显；占比明细默认收起，点标题行或右上角箭头展开。
+  // detailOpen 由槽位组件持有（本地持久化），Card 保持无 hook —— 渲染期可被单独喂数据测。
+  const toggleDetail = props.onToggleDetail
+  const canToggle = typeof toggleDetail === 'function'
+  const detailOpen = props.detailOpen === true
   // 显示开关来自设置页；缺省（老 payload）按显示处理
   const showAmount = !data.display || data.display.showAmount !== false
   const showAttr = !data.display || data.display.showAttribution !== false
@@ -218,7 +223,12 @@ function Card(props) {
             ? '含估算：插件加载前的轮次按当前档位线性估算，加载后按每轮实际时刻定价（覆盖 ' + Math.round((c.pricing.coverage || 0) * 100) + '%）'
             : '全部轮次按各自时刻定价（精确）',
           style: { fontSize: '13px', fontWeight: 600, ...mono },
-        }, fmtCny(c.totalCny)) : null)),
+        }, fmtCny(c.totalCny)) : null,
+        (attr == null || !showAttr || !canToggle) ? null : h('span', {
+          onClick: toggleDetail,
+          title: detailOpen ? '收起占比明细' : '展开占比明细',
+          style: { cursor: 'pointer', color: MUTED, fontSize: '11px', padding: '0 2px', userSelect: 'none' },
+        }, detailOpen ? '▾' : '▸'))),
 
     h('div', { style: { display: 'grid', gridTemplateColumns: 'auto 1fr auto 1fr', gap: '2px 8px', marginTop: '7px' } },
       h('span', { style: muted }, '输入未命中'), h('span', { style: mono }, fmtExact(m.uncachedInputTokens)),
@@ -229,7 +239,7 @@ function Card(props) {
     c.unpriced && showAmount ? h('div', { style: { ...muted, marginTop: '6px' } },
       '当前模型未定价（' + (data.session.model || '未知') + '），金额不计入') : null,
 
-    (attr == null || !showAttr) ? null : h('div', null,
+    (attr == null || !showAttr || !detailOpen) ? null : h('div', null,
       h('div', { style: { height: '1px', background: HAIRLINE, margin: '9px 0 7px' } }),
       h('div', { style: rowStyle },
         h('span', { style: muted }, '上下文占比 · ' + fmtCount(attr.totalTokens)),
@@ -266,6 +276,16 @@ function Card(props) {
       attr.pending || attr.fallbackReason
         ? h('div', { style: { ...muted, marginTop: '4px' } }, attr.pending || ('退回内核三元：' + attr.fallbackReason))
         : null),
+
+    // 收起态：明细不渲染，但占比总量与展开入口留在原位 —— 收起后仍看得出「上下文占了多少」
+    (attr == null || !showAttr || detailOpen) ? null : h('div', { style: { borderTop: '1px solid ' + HAIRLINE, marginTop: '8px', paddingTop: '6px' } },
+      h('div', {
+        onClick: canToggle ? toggleDetail : undefined,
+        title: canToggle ? '展开占比明细' : undefined,
+        style: { ...rowStyle, cursor: canToggle ? 'pointer' : 'default' },
+      },
+        h('span', { style: muted }, '上下文占比 · ' + fmtCount(attr.totalTokens)),
+        h('span', { style: { ...muted, border: '1px solid ' + HAIRLINE, borderRadius: '4px', padding: '0 4px' } }, canToggle ? '估算 ▸' : '估算'))),
 
     // 导出入口已移到设置页的「用量卡片」tab（那里可勾选会话），卡片上不再重复放
     (data.subagents && (data.subagents.count > 0 || data.subagents.unavailable)) ? h('div', { style: { borderTop: '1px solid ' + HAIRLINE, marginTop: '8px', paddingTop: '7px' } },
@@ -531,13 +551,28 @@ function SessionBeacon(props) {
   return null
 }
 
-/** 槽位组件：按 wide 切换折叠/展开两态。 */
+/** 明细展开状态：客户端本地记（每个浏览器各记各的），不占宿主设置。 */
+const DETAIL_KEY = 'dsh-usage-card.detailOpen'
+function readDetailOpen() {
+  try { return globalThis.localStorage?.getItem(DETAIL_KEY) === '1' } catch { return false }
+}
+function writeDetailOpen(v) {
+  try { globalThis.localStorage?.setItem(DETAIL_KEY, v ? '1' : '0') } catch { /* 无 localStorage（隐私模式/测试）时只当次生效 */ }
+}
+
+/** 槽位组件：按 wide 切换折叠/展开两态；展开态内部再按 detailOpen 分三段。 */
 function UsageCardSlot(props) {
   const state = usePayload()
+  const [detailOpen, setDetailOpen] = useState(readDetailOpen())
   const wide = !!(props && props.wide)
   const data = state.data
   return wide
-    ? h(Card, { data, error: state.error })
+    ? h(Card, {
+        data,
+        error: state.error,
+        detailOpen,
+        onToggleDetail: () => { const next = !detailOpen; writeDetailOpen(next); setDetailOpen(next) },
+      })
     : h(Ring, { data })
 }
 

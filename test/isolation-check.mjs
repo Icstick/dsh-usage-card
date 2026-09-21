@@ -115,7 +115,8 @@ try {
 console.log('客户端半 · 敌意 payload 渲染')
 const src = readFileSync(new URL('../client/index.js', import.meta.url), 'utf8')
 
-let nextState = null
+// useState 按调用顺序取队列：槽位组件第 1 次拿 payload 状态，第 2 次拿「明细展开」状态
+let stateQueue = []
 function makeFakeReact() {
   const createElement = (type, props, ...children) => ({
     type,
@@ -124,7 +125,7 @@ function makeFakeReact() {
   return {
     createElement,
     Component: class { constructor(props) { this.props = props; this.state = {} } },
-    useState: (initial) => [nextState === null ? initial : nextState, () => {}],
+    useState: (initial) => [stateQueue.length > 0 ? stateQueue.shift() : initial, () => {}],
     useEffect: () => {},
     useSyncExternalStore: () => ({}),
     useRef: (v) => ({ current: v }),
@@ -201,12 +202,27 @@ clientExports.apply(fakeCtx)
 const cardSlot = slots.find((s) => s.spec.id === 'usage-card' && s.spec.name === 'sidebar.footer.action')
 await t('卡片组件注册进 sidebar.footer.action', () => assert.ok(cardSlot && typeof cardSlot.comp === 'function'))
 
-/** 渲染一次卡片（宽/窄两态），返回合并后的文本。 */
-function renderCard(payload, error) {
-  nextState = { loading: false, data: payload, error }
+/** 渲染一次卡片（宽/窄两态；宽态再指定明细展开与否），返回合并后的文本。 */
+function renderCard(payload, error, detailOpen = false) {
+  stateQueue = [{ loading: false, data: payload, error }, detailOpen]
   const wide = renderNode(cardSlot.comp({ wide: true }))
+  stateQueue = [{ loading: false, data: payload, error }, detailOpen]
   const narrow = renderNode(cardSlot.comp({ wide: false }))
   return textOf(wide) + ' | ' + textOf(narrow)
+}
+
+// 形状完整、可定价的 payload —— 三段折叠（Q1=B）的正例
+const VALID = {
+  ok: true,
+  session: { model: 'deepseek-flash' },
+  measured: { uncachedInputTokens: 96_266, cacheReadTokens: 6_955_648, cacheWriteTokens: 0, outputTokens: 67_618, totalTokens: 7_119_532, cacheHitRate: 0.99 },
+  cost: { unpriced: false, totalCny: 0.55, totalUsd: 0.0819, inputUsd: 0.05, outputUsd: 0.0319, pricing: { mode: 'per-turn', coverage: 1 }, fx: { rate: 6.718405 } },
+  attribution: { source: 'estimate', totalTokens: 221_300, rows: [
+    { key: 'system', label: '系统提示', share: 0.14, costCny: 0.04 },
+    { key: 'toolsSchema', label: '工具 schema', share: 0.02, costCny: 0.01 },
+    { key: 'toolResult', label: '工具结果', share: 0.33, costCny: 0.08 },
+  ] },
+  display: { showAmount: true, showAttribution: true },
 }
 
 const EVIL = [
@@ -227,13 +243,37 @@ const EVIL = [
 
 for (const [label, payload, expect] of EVIL) {
   await t('渲染不抛：' + label, () => {
-    const text = renderCard(payload)
+    const text = renderCard(payload, undefined, false) + ' ' + renderCard(payload, undefined, true)
     assert.ok(text.length > 0, '应该有输出')
     if (expect === 'schema') assert.match(text, /不认识|渲染失败/, '应报结构不认识：' + text.slice(0, 80))
     if (expect === 'degraded') assert.match(text, /不可用/, '应走降级文案：' + text.slice(0, 80))
     if (expect === 'boundary') assert.match(text, /已隔离/, '应由渲染边界兜住：' + text.slice(0, 80))
   })
 }
+
+console.log('客户端半 · 三段折叠（Q1=B）')
+await t('默认收起：只出占比总量与展开入口，不渲染逐项明细', () => {
+  const text = renderCard(VALID, undefined, false)
+  assert.match(text, /上下文占比 · 221k/)  // fmtCount：221300 → 221k
+  assert.match(text, /估算 ▸/)
+  assert.doesNotMatch(text, /工具 schema/, '收起态不该出现逐项行')
+  assert.doesNotMatch(text, /合计/, '收起态不该出现合计行')
+})
+await t('展开：逐项明细与输出/合计两行都在', () => {
+  const text = renderCard(VALID, undefined, true)
+  assert.match(text, /工具 schema/)
+  assert.match(text, /合计/)
+  assert.match(text, /输出/)
+})
+await t('头部金额常显（收起态也在）', () => {
+  assert.match(renderCard(VALID, undefined, false), /¥0\.55/)
+  assert.match(renderCard(VALID, undefined, true), /¥0\.55/)
+})
+await t('窄态（rail）仍只渲染环，不渲染明细', () => {
+  stateQueue = [{ loading: false, data: VALID }, false]
+  const narrow = textOf(renderNode(cardSlot.comp({ wide: false })))
+  assert.doesNotMatch(narrow, /上下文占比/)
+})
 
 await t('fetch 失败（error 有值、data 为 undefined）→ FETCH_FAILED 文案', () => {
   const text = renderCard(undefined, 'NetworkError')
