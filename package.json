@@ -50,7 +50,7 @@
   },
   "scripts": {
     "build:client": "node scripts/build-client.mjs",
-    "test": "node test/m0-check.mjs && node test/wiring-check.mjs && node test/subagent-check.mjs && node test/report-check.mjs && node test/prices-check.mjs",
+    "test": "node test/m0-check.mjs && node test/wiring-check.mjs && node test/subagent-check.mjs && node test/report-check.mjs && node test/prices-check.mjs && node test/isolation-check.mjs",
     "verify": "node scripts/verify.mjs"
   }
 }

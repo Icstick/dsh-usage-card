@@ -98,6 +98,7 @@ node scripts/install-local.mjs --uninstall  # 可逆
 5. **峰谷按 UTC + ISO 星期判定**，禁用本机时区方法。
 6. **价目只由官方页面驱动**，不按「预期下线/预期调价」提前改价。
 7. **降级要说出来。** 投影不可用、会话未加载、价表退回内核三元……都走明确原因码，不静默显示 0 或别人的数字。
+8. **渲染期不抛。** 卡片挂在宿主侧栏里，抛出去会把别人的界面一起带下水。所以两道闸：`ok:true` 的 payload 先过形状闸（不认识就报 `SCHEMA_MISMATCH`，不硬按老字段取），过了还抛的由渲染边界兜成一行提示（`用量卡片渲染失败，已隔离`，悬停看原因）。原因码一律安全转字符串——`reason` 是对象时不参与拼接。
 
 ## 数据来源
 
@@ -120,9 +121,13 @@ node test/m0-check.mjs          # 纯函数与 payload 验收
 node test/wiring-check.mjs      # 接线验证（假 ctx 跑 apply）
 node test/subagent-check.mjs    # 子代理归集（实测四桶 + 已释放的诚实处理）
 node test/report-check.mjs      # 报告：多帧解码、逐轮折叠、聚合与渲染
-npm test                        # 以上全部
+node test/isolation-check.mjs   # M5-b 崩溃隔离（敌意 URL/坏日志 + 迷你渲染器灌敌意 payload）
+npm test                        # 以上全部（不含需要真实日志的 coverage-check）
 node scripts/verify.mjs         # 起服务后自检路由与 payload
+node test/coverage-check.mjs    # M5-a 老会话覆盖率实测（读本机 DSH_HOME/sessions 真实日志，非 CI）
 ```
+
+`coverage-check` 的输出就是「老会话到底能算出多少」：扫描会话数、轮次、可定价/未定价、坏行、耗时，以及未定价都落在哪些模型上（决定覆盖率是价表缺口还是历史脏数据）。本机 W 机实测：74 个日志 / 16 个用户会话 + 58 个子代理 / 3,363 轮 / 覆盖率 100.00% / 0 坏行 / 1.75 s。
 
 宿主半改动要重启 `dsh web`；客户端改动要重建 + 刷新页面。
 
@@ -138,7 +143,6 @@ node scripts/verify.mjs         # 起服务后自检路由与 payload
 - 金额**按轮计价**（每轮用它自己的时刻判峰谷）。插件重启前已产生的轮次没有时间戳，那部分按当前档位线性估算，卡片上打「含估算」并给出覆盖率；新会话从第一轮起就是精确的
 - 「环境注入」与「用户消息」的区分依赖事件形态，宿主改了格式可能要跟
 - 汇率目前是手动兜底值（设置页里可改）
-- subagent 汇总尚未接入
 
 ## 路线图
 

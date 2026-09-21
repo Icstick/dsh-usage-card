@@ -7,7 +7,8 @@
 // 样式用「主题无关」的中性 rgba，不依赖具体主题 token，深色/浅色都不至于看不见。
 // React 无顶层 h（那是 preact 的 API）：createElement 起别名 h。
 
-const { createElement: h, useState, useEffect, useSyncExternalStore } = require('react')
+const React = require('react')
+const { createElement: h, useState, useEffect, useSyncExternalStore } = React
 
 const ROUTE = '/usage-card/current.json'
 const POLL_MS = 3000
@@ -46,6 +47,51 @@ const HINTS = {
 const MUTED = 'rgba(140,146,156,1)'
 const HAIRLINE = 'rgba(127,127,127,.22)'
 const CARD_BG = 'rgba(127,127,127,.10)'
+
+// ── 崩溃隔离（M5-b）─────────────────────────────────────────────────────────
+// 卡片渲染期抛出去，会把承载它的宿主界面一起拖下水。两道闸：
+//   1) 形状闸：ok:true 的 payload 先过 schema 检查 —— 版本漂移、路由被别的插件占了、
+//      代理塞了半截 JSON，都会走到这里；宁可显示「不认识」也不在半路 TypeError。
+//   2) 边界闸：真的还抛（今天没想到的路径），降级成一行提示，绝不向上冒泡。
+/** 原因码安全转字符串：reason 可能是对象，甚至 toString 被写成 null 的敌意对象。 */
+function safeReason(v) {
+  if (typeof v === 'string') return v
+  if (v === null || v === undefined || typeof v === 'object') return 'UNKNOWN'
+  try { return String(v) } catch { return 'UNKNOWN' }
+}
+
+/** ok:true 的 payload 是否具备渲染所需的最小形状。 */
+function payloadSane(data) {
+  if (typeof data !== 'object' || data === null) return false
+  const m = data.measured
+  const c = data.cost
+  if (typeof m !== 'object' || m === null) return false
+  if (typeof c !== 'object' || c === null) return false
+  return Number.isFinite(m.totalTokens)
+}
+
+/** 渲染边界：子树抛错时降级成一行提示，不向上冒泡。 */
+class CardBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { failed: null } }
+  static getDerivedStateFromError(error) { return { failed: safeReason(error && error.message) } }
+  componentDidCatch(error) {
+    try { console.error('[dsh-usage-card] card render failed', error) } catch { /* 控制台不可用就算了 */ }
+  }
+  render() {
+    if (this.state.failed !== null) {
+      return h('div', {
+        style: { padding: '6px 8px', fontSize: '11px', color: MUTED, border: '1px solid ' + HAIRLINE, borderRadius: '9px' },
+        title: this.state.failed,
+      }, '用量卡片渲染失败，已隔离')
+    }
+    return this.props.children
+  }
+}
+
+/** 把一个槽位组件包进渲染边界。 */
+function withBoundary(Component) {
+  return (props) => h(CardBoundary, null, h(Component, props ?? {}))
+}
 
 /** 轮询宿主 payload；返回 { loading, data, error }。 */
 function usePayload() {
@@ -138,11 +184,15 @@ function Card(props) {
   const muted = { color: MUTED, fontSize: '11px' }
   const mono = { fontVariantNumeric: 'tabular-nums' }
 
-  if (!data || data.ok !== true) {
-    const reason = data && data.reason ? data.reason : (props.error ? 'FETCH_FAILED' : 'LOADING')
+  if (!data || data.ok !== true || !payloadSane(data)) {
+    // ok:true 但形状不认识 = 版本漂移，不是「没有数据」——分开报，否则查错方向
+    const reason = data && data.ok === true
+      ? 'SCHEMA_MISMATCH'
+      : (data && data.reason !== undefined ? safeReason(data.reason) : (props.error ? 'FETCH_FAILED' : 'LOADING'))
     const text = {
       LOADING: '正在读取…', NO_SESSION: '等待首个会话事件', NO_USAGE_YET: '本会话还没产生用量',
       PROJECTION_UNAVAILABLE: '投影服务不可用', FETCH_FAILED: '宿主路由不可达',
+      SCHEMA_MISMATCH: '宿主返回的用量数据结构不认识',
     }[reason] || ('不可用：' + reason)
     return h('div', { style: box },
       h('div', { style: rowStyle }, h('span', { style: muted }, '本会话用量'), h('span', { style: muted }, text)))
@@ -151,7 +201,7 @@ function Card(props) {
   const m = data.measured
   const c = data.cost
   const attr = data.attribution
-  const rows = attr && attr.rows ? attr.rows : []
+  const rows = attr && Array.isArray(attr.rows) ? attr.rows : []
   // 显示开关来自设置页；缺省（老 payload）按显示处理
   const showAmount = !data.display || data.display.showAmount !== false
   const showAttr = !data.display || data.display.showAttribution !== false
@@ -495,7 +545,7 @@ function UsageCardSlot(props) {
 function apply(ctx) {
   ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
     { name: 'sidebar.footer.action', id: 'usage-card', order: 50 },
-    UsageCardSlot,
+    withBoundary(UsageCardSlot),
   ))
   ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register(
     { name: 'conversation.composer.dock', id: 'usage-card-beacon', order: 99 },
@@ -506,7 +556,7 @@ function apply(ctx) {
     const scope = ctx.settingsScope.bind({ namespace: NS })
     ctx.slots.inject('settings.section', () => ctx.slots.register(
       { name: 'settings.section', id: 'usage-card', order: 170, label: '用量卡片' },
-      makeSettingsSection(scope),
+      withBoundary(makeSettingsSection(scope)),
     ))
   }
 }
