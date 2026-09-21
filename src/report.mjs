@@ -167,7 +167,7 @@ export function userSessions(sessions, include = false) {
 
 /** 把多个会话折叠结果合成一份报告。 */
 export function buildReport(sessions, deps) {
-  const { fxRate, generatedAt, priceVersion, covers } = deps
+  const { fxRate, generatedAt, priceVersion, covers, ledger = null } = deps
   const byDay = new Map()
   const byModel = new Map()
   let usd = 0
@@ -190,6 +190,10 @@ export function buildReport(sessions, deps) {
   }
   return {
     generatedAt, priceVersion, fxRate, covers,
+    // 账本口径（写入时定价，冻结）：只作为**对照**出现在报告里。
+    // 报告主体仍是"用当前价表重算日志"，因为报告以日志为权威、且经常要回答
+    // 「按今天的价，这段时间要多少钱」。两者给的数不一样时，差异就是官方调价的量。
+    ledger: ledger === null ? null : { ...ledger, cny: ledger.usd * fxRate },
     sessionsScanned: sessions.length, turns, unpricedTurns, usd,
     cny: usd * fxRate,
     days: [...byDay.values()].sort((a, b) => (a.day < b.day ? 1 : -1)),
@@ -215,6 +219,22 @@ export function renderMarkdown(report) {
   lines.push('| 金额 | ' + cny(report.usd) + ' (USD ' + report.usd.toFixed(6) + ') |')
   lines.push('| 未定价轮次 | ' + report.unpricedTurns + (report.unpricedTurns > 0 ? '（未计入金额）' : '') + ' |')
   lines.push('')
+  if (report.ledger != null && report.ledger.turns > 0) {
+    const diff = report.ledger.cny - report.cny
+    // 符号写在币种前面（-¥0.70 而不是 ¥-0.70）
+    const sign = diff > 0 ? '+' : (diff < 0 ? '-' : '')
+    lines.push('## 账本口径对照')
+    lines.push('')
+    lines.push('| 口径 | 轮次 | 金额 |')
+    lines.push('|---|---|---|')
+    lines.push('| 账本（写入时定价，已冻结） | ' + report.ledger.turns + ' | ¥' + report.ledger.cny.toFixed(4) + ' |')
+    lines.push('| 当前价重算（上表即此口径） | ' + report.turns + ' | ¥' + report.cny.toFixed(4) + ' |')
+    lines.push('| 差异 | ' + (report.ledger.turns - report.turns) + ' | ' + sign + '¥' + Math.abs(diff).toFixed(4) + ' |')
+    lines.push('')
+    lines.push('> 差异来自官方调价或价表覆盖：账本里的历史轮次按**写入当时**的价目计价，不随价表变化而漂移；')
+    lines.push('> 上表则一律按当前价表重算。账本只服务侧栏卡片，报告仍以日志为权威。')
+    lines.push('')
+  }
   lines.push('## 按天')
   lines.push('')
   lines.push('| 日期 | 轮次 | token | 金额 |')

@@ -15,6 +15,7 @@ import { homedir } from 'node:os'
 import z from '@deepseek-ai/schemastery'
 import { buildReport, foldSession, listSessionLogs, readSessionLog, renderCsv, renderMarkdown, userSessions } from './report.mjs'
 import { acceptParsed, OFFICIAL_PRICING_URL, parseOfficialPricing } from './prices-sync.mjs'
+import { createLedger, foldRows, rowKey } from './ledger.mjs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -749,8 +750,18 @@ export function apply(ctx) {
     return () => { cancelled = true }
   }, 'usage-card: fx auto sync')
 
-  /** 按轮计价账本：会话 id → 逐轮累加的四桶与金额（峰谷按**每轮自己的时间**判定）。 */
+  /** 按轮计价账本（内存）：会话 id → 逐轮累加的四桶与金额（峰谷按**每轮自己的时间**判定）。 */
   const folds = new Map()
+  /**
+   * 逐轮账本（落盘）：本机缓存，金额在写入时算定并冻结，重启后不必重走日志。
+   * 坏了只记 warn —— 最坏是回到"走日志回填"，绝不会让卡片降级。见 ledger.mjs 的模块说明。
+   */
+  const ledger = createLedger({
+    home: process.env.DSH_HOME ?? join(homedir(), '.dsh'),
+    onWarn: (message) => { try { ctx.logger?.warn?.('usage-card: ' + message) } catch { /* 日志不可用不影响 */ } },
+  })
+  /** 已记过的轮次键（sessionId#seq）：回填与实时事件交叠时靠它幂等。 */
+  const turnKeys = new Set()
   /** 已经回填过的会话（回填是 O(事件数)，每个会话只做一次）。 */
   const backfilled = new Set()
   /** 会话 id → 最近一次请求的模型（逐轮定价要用当时那个模型的价）。 */
@@ -771,6 +782,12 @@ export function apply(ctx) {
     if (Math.abs(Date.now() - time) > 2 * 365 * 24 * 3600 * 1000) return
     const id = session?.header?.id ?? session?.id
     if (id == null) return
+    // 幂等：同一会话的同一 seq 就是同一轮。回填、重放、实时事件交叠时靠这条去重，
+    // 否则同一轮会被记两遍（金额直接翻倍）。
+    const seq = Number.isInteger(event?.seq) ? event.seq : null
+    const key = seq === null ? id + '@' + time : id + '#' + seq
+    if (turnKeys.has(key)) return
+    turnKeys.add(key)
     const buckets = {
       uncachedInputTokens: usage.inputTokens ?? 0,
       cacheReadTokens: usage.cacheReadTokens ?? 0,
@@ -784,14 +801,35 @@ export function apply(ctx) {
     fold.cacheReadTokens += buckets.cacheReadTokens
     fold.outputTokens += buckets.outputTokens
     fold.turns += 1
-    const price = priceFor(sessionModels.get(id) ?? currentModel, new Date(time))
+    const model = sessionModels.get(id) ?? currentModel
+    const price = priceFor(model, new Date(time))
+    let usdInput = null
+    let usdOutput = null
     if (price == null) {
       fold.unpricedTurns += 1
     } else {
-      fold.usdInput += (buckets.uncachedInputTokens / 1e6) * price.cacheMiss + (buckets.cacheReadTokens / 1e6) * price.cacheHit
-      fold.usdOutput += (buckets.outputTokens / 1e6) * price.output
+      usdInput = (buckets.uncachedInputTokens / 1e6) * price.cacheMiss + (buckets.cacheReadTokens / 1e6) * price.cacheHit
+      usdOutput = (buckets.outputTokens / 1e6) * price.output
+      fold.usdInput += usdInput
+      fold.usdOutput += usdOutput
     }
     folds.set(id, fold)
+    // 落盘：金额在**此刻**算定，连同当时用的价目版本一起冻结。此后再不重算 ——
+    // 官方调价只影响之后的轮次，历史金额不跟着漂（这是账本存在的首要理由）。
+    if (seq !== null) {
+      ledger.append({
+        sessionId: id,
+        seq,
+        time,
+        model: model ?? null,
+        tier: price?.tier ?? null,
+        buckets: { ...buckets, cacheWriteTokens: usage.cacheWriteTokens ?? 0 },
+        usdInput,
+        usdOutput,
+        priceVersion: PRICES.generatedAt ?? null,
+        pluginVersion: PLUGIN_VERSION,
+      })
+    }
   }
 
   /**
@@ -807,6 +845,39 @@ export function apply(ctx) {
     const id = session?.header?.id ?? session?.id
     if (id == null || backfilled.has(id)) return
     backfilled.add(id)
+    // 1) 先吃账本：命中的轮次直接用**当时算定的金额**，不重算也不读日志。
+    //    读不出来就当没有（账本是缓存，坏了顶多回到走日志）。
+    let throughSeq = null
+    try {
+      for (const row of ledger.load(id)) {
+        if (throughSeq === null || row.seq > throughSeq) throughSeq = row.seq
+        const key = rowKey(row)
+        if (turnKeys.has(key)) continue
+        turnKeys.add(key)
+        const fold = folds.get(id) ?? {
+          uncachedInputTokens: 0, cacheReadTokens: 0, outputTokens: 0,
+          usdInput: 0, usdOutput: 0, turns: 0, unpricedTurns: 0,
+        }
+        const b = row.buckets ?? {}
+        fold.uncachedInputTokens += Number(b.uncachedInputTokens) || 0
+        fold.cacheReadTokens += Number(b.cacheReadTokens) || 0
+        fold.outputTokens += Number(b.outputTokens) || 0
+        fold.turns += 1
+        if (Number.isFinite(row.usdInput) && Number.isFinite(row.usdOutput)) {
+          fold.usdInput += row.usdInput
+          fold.usdOutput += row.usdOutput
+        } else {
+          fold.unpricedTurns += 1
+        }
+        folds.set(id, fold)
+      }
+    } catch (error) {
+      try { ctx.logger?.warn?.('usage-card: 账本读取失败，退回日志回填：' + String(error?.message ?? error)) } catch { /* 同上 */ }
+    }
+    // 2) 日志只补账本没覆盖的部分；账本已经覆盖到会话末尾时，**一次日志都不读**。
+    const endSeq = Number(session.seq)
+    if (throughSeq !== null && Number.isFinite(endSeq) && endSeq <= throughSeq) return
+    const startAfter = throughSeq === null ? 0 : throughSeq + 1
     let events = null
     try {
       const maybe = session.events
@@ -814,10 +885,9 @@ export function apply(ctx) {
     } catch { /* 访问器不可用，走退路 */ }
     if (events === null) {
       try {
-        const end = Number(session.seq)
-        if (Number.isFinite(end) && end > 0 && typeof session.eventAt === 'function') {
+        if (Number.isFinite(endSeq) && endSeq > 0 && typeof session.eventAt === 'function') {
           events = []
-          for (let i = 0; i <= end; i += 1) {
+          for (let i = startAfter; i <= endSeq; i += 1) {
             const e = session.eventAt(i)
             if (e != null) events.push(e)
           }
@@ -965,7 +1035,8 @@ export function apply(ctx) {
    * @param only - 只导出这些会话 id（null = 全部）
    */
   const reportFor = (format, settings, only = null, includeSubagents = false) => {
-    const key = format + '|' + settings.fxRate + '|' + (only == null ? '*' : only.join(',')) + '|' + (includeSubagents ? 'sub' : 'user')
+    // 账本行数进缓存键：账本长起来了，对照那一行也得跟着变
+    const key = format + '|' + settings.fxRate + '|' + (only == null ? '*' : only.join(',')) + '|' + (includeSubagents ? 'sub' : 'user') + '|' + ledger.stats().written
     const now = Date.now()
     const cached = reportCache.get(key)
     if (cached !== undefined && now - cached.at < REPORT_TTL_MS) return cached
@@ -974,11 +1045,26 @@ export function apply(ctx) {
       const wanted = new Set(only)
       sessions = sessions.filter((s) => wanted.has(s.sessionId))
     }
+    // 账本口径只做对照（冻结的历史金额），主体仍按当前价表重算日志
+    let ledgerTotals = null
+    try {
+      let turns = 0
+      let usd = 0
+      let unpricedTurns = 0
+      for (const s of sessions) {
+        const folded = foldRows(ledger.load(s.sessionId))
+        turns += folded.turns
+        usd += folded.usd
+        unpricedTurns += folded.unpricedTurns
+      }
+      if (turns > 0) ledgerTotals = { turns, usd, unpricedTurns }
+    } catch { ledgerTotals = null }
     const report = buildReport(sessions, {
       fxRate: settings.fxRate,
       generatedAt: new Date().toISOString(),
       priceVersion: PRICES.generatedAt ?? null,
       covers: sessions.length,
+      ledger: ledgerTotals,
     })
     const body = format === 'csv' ? renderCsv(report) : renderMarkdown(report)
     const contentType = format === 'csv' ? 'text/csv; charset=utf-8' : 'text/markdown; charset=utf-8'
