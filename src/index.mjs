@@ -31,8 +31,15 @@ export const SETTINGS_NAMESPACE = 'dsh-usage-card'
  * 留空则用 schema 默认值（与设计文稿一致的做法）。
  */
 export const SETTINGS_SCHEMA = z.object({
-  /** 展示汇率：美元 → 人民币。默认 7.2，用户可改。 */
+  /** 展示汇率：美元 → 人民币。默认 7.2，用户可改，也可由同步写入。 */
   fxRate: z.number().min(0.01).max(1000).default(7.2),
+  /** 是否在拉起 dsh 时自动同步一次汇率（一次 HTTP GET；失败保留现值）。 */
+  fxAuto: z.boolean().default(true),
+  /** 上一次同步写入的汇率。与 fxRate 不等 = 之后被人手改过，自动同步要让位。 */
+  fxSyncedRate: z.number().default(0),
+  /** 上一次成功同步的时间（ISO）与来源 id；空 = 从未同步过。 */
+  fxSyncedAt: z.string().default(''),
+  fxSource: z.string().default(''),
   /** 是否在卡片上显示金额。与其它显示金额的插件同屏时可关掉。 */
   showAmount: z.boolean().default(true),
   /** 是否显示上下文占比这一整块。 */
@@ -40,7 +47,10 @@ export const SETTINGS_SCHEMA = z.object({
 })
 
 /** 设置缺省值（scope 不可用时的兜底，与 schema 默认一致）。 */
-export const SETTINGS_DEFAULTS = { fxRate: 7.2, showAmount: true, showAttribution: true }
+export const SETTINGS_DEFAULTS = {
+  fxRate: 7.2, fxAuto: true, fxSyncedRate: 0, fxSyncedAt: '', fxSource: '',
+  showAmount: true, showAttribution: true,
+}
 
 /** 卡片轮询的只读路由。 */
 export const ROUTE = '/usage-card/current.json'
@@ -100,6 +110,69 @@ export async function fetchUsdCny(fetchImpl = fetch) {
     } catch { /* 试下一个源 */ }
   }
   return null
+}
+
+/** 自动同步的最小间隔：挡住崩溃循环/反复重启把同一件事重复做很多遍。 */
+export const FX_AUTO_MIN_INTERVAL_MS = 10 * 60 * 1000
+
+/**
+ * 拉起时要不要自动同步汇率。
+ *
+ * 三条规则，各自挡一个真实的坏结果：
+ *   - `fxAuto` 关掉 → 不动（用户明确要求）；
+ *   - 从未同步过（`fxSyncedAt` 为空）→ 放行。**这一条不能省**：否则全新安装的默认
+ *     7.2 会被当成「手动覆盖」，自动同步永远跑不起来；
+ *   - 同步过、但当前汇率 ≠ 上次同步写入的值 → 判定为**人手改过**，让位（否则每次
+ *     重启都会把手填的记账汇率冲掉）；
+ *   - 距上次成功同步不足 10 分钟 → 跳过。
+ * @param settings - 已解析的设置
+ * @param now - 毫秒时间戳（可注入以便测试）
+ */
+export function shouldAutoSync(settings, now = Date.now()) {
+  if (settings?.fxAuto === false) return { ok: false, reason: 'DISABLED' }
+  const stamped = typeof settings?.fxSyncedAt === 'string' ? settings.fxSyncedAt : ''
+  if (stamped !== '') {
+    const syncedRate = Number(settings.fxSyncedRate)
+    if (!Number.isFinite(syncedRate) || Math.abs(syncedRate - Number(settings.fxRate)) > 1e-9) {
+      return { ok: false, reason: 'MANUAL_OVERRIDE' }
+    }
+    const at = Date.parse(stamped)
+    if (Number.isFinite(at) && now - at < FX_AUTO_MIN_INTERVAL_MS) return { ok: false, reason: 'RECENT' }
+  }
+  return { ok: true }
+}
+
+/**
+ * 拉起时自动同步一次汇率。**永不抛、永不阻塞调用方**。
+ * 成功 → 写 fxRate/fxSyncedRate/fxSyncedAt/fxSource；失败 → 原样保留，只记日志。
+ * @param deps - { settings, write, fetchImpl, now, log }
+ */
+export async function autoSyncFx({ settings, write, fetchImpl = fetch, now = Date.now(), log } = {}) {
+  const verdict = shouldAutoSync(settings, now)
+  if (!verdict.ok) return { ok: false, reason: verdict.reason }
+  let found = null
+  try {
+    found = await fetchUsdCny(fetchImpl)
+  } catch {
+    found = null
+  }
+  if (found === null) {
+    try { log?.('warn', 'fx auto sync: 所有汇率源都不可用，保留当前值 ' + String(settings?.fxRate)) } catch { /* 日志不可用不影响 */ }
+    return { ok: false, reason: 'FX_UNAVAILABLE' }
+  }
+  try {
+    await write({
+      fxRate: found.rate,
+      fxSyncedRate: found.rate,
+      fxSyncedAt: new Date(now).toISOString(),
+      fxSource: found.source,
+    })
+  } catch (error) {
+    try { log?.('warn', 'fx auto sync: 写入设置失败 ' + String(error?.message ?? error)) } catch { /* 同上 */ }
+    return { ok: false, reason: 'WRITE_FAILED' }
+  }
+  try { log?.('info', 'fx auto sync: ' + found.rate + '（' + found.source + '）') } catch { /* 同上 */ }
+  return { ok: true, rate: found.rate, source: found.source }
 }
 
 /**
@@ -461,12 +534,17 @@ export async function collectSubagents(ctx, parentId, settings, now = new Date()
  * 当前汇率快照。取自设置页的 fxRate；M4 接自动更新（拉取失败再退回这里的手动值）。
  * @param settings - 已解析的设置值
  */
-function fxSnapshot(settings) {
+export function fxSnapshot(settings) {
+  // 诚实标注：只有当**当前汇率就是上次同步写进去的那个值**时，才敢说它是同步来的。
+  // 同步之后被人手改过（两个值不等），或者从未同步过，一律算「手动」。
+  const syncedRate = Number(settings?.fxSyncedRate)
+  const synced = settings?.fxSyncedAt !== '' && Number.isFinite(syncedRate)
+    && Math.abs(syncedRate - Number(settings.fxRate)) < 1e-9
   return {
     rate: settings.fxRate,
-    source: 'settings',
-    at: new Date().toISOString(),
-    status: 'manual',
+    source: synced ? settings.fxSource : 'settings',
+    at: synced ? settings.fxSyncedAt : null,
+    status: synced ? 'synced' : 'manual',
   }
 }
 
@@ -653,6 +731,23 @@ export function apply(ctx) {
     settingsScope = ctx.settings.register(SETTINGS_NAMESPACE, SETTINGS_SCHEMA)
     return () => { settingsScope = null }
   }, 'usage-card: settings')
+
+  // M6：拉起 dsh 时自动同步一次汇率。不 await —— 启动关键路径上不能等网络；
+  // 也永不冒泡（失败只留日志），最坏情况就是沿用现值。
+  ctx.effect(() => {
+    let cancelled = false
+    void Promise.resolve()
+      .then(() => {
+        if (cancelled) return undefined
+        return autoSyncFx({
+          settings: readSettings(),
+          write: (patch) => (settingsScope === null ? Promise.resolve() : Promise.resolve(settingsScope.update(patch))),
+          log: (level, message) => { try { ctx.logger?.[level]?.(message) } catch { /* 宿主无 logger 就只当无事发生 */ } },
+        })
+      })
+      .catch(() => { /* 自动同步的存在意义就是不惊动任何人 */ })
+    return () => { cancelled = true }
+  }, 'usage-card: fx auto sync')
 
   /** 按轮计价账本：会话 id → 逐轮累加的四桶与金额（峰谷按**每轮自己的时间**判定）。 */
   const folds = new Map()
@@ -996,9 +1091,14 @@ export function apply(ctx) {
             res.end(JSON.stringify({ ok: false, reason: 'FX_UNAVAILABLE' }))
             return
           }
-          if (settingsScope !== null) await settingsScope.update({ fxRate: found.rate })
+          // 手动同步也盖同一组戳：它同样是「从实时源拿到的值」。
+          // 盖上之后 shouldAutoSync 才会认为「当前值没有被手改」，下一次拉起才会继续自动更新。
+          const at = new Date().toISOString()
+          if (settingsScope !== null) {
+            await settingsScope.update({ fxRate: found.rate, fxSyncedRate: found.rate, fxSyncedAt: at, fxSource: found.source })
+          }
           res.statusCode = 200
-          res.end(JSON.stringify({ ok: true, rate: found.rate, source: found.source, at: new Date().toISOString() }))
+          res.end(JSON.stringify({ ok: true, rate: found.rate, source: found.source, at }))
         } catch (error) {
           res.statusCode = 500
           res.end(JSON.stringify({ ok: false, reason: 'FX_FAILED', detail: String(error?.message ?? error).slice(0, 160) }))

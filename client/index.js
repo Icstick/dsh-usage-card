@@ -314,7 +314,8 @@ const NS = 'dsh-usage-card'
 
 /** 设置项定义（顺序即渲染顺序）。留空 = 用设计默认值。 */
 const FIELDS = [
-  { name: 'fxRate', label: '汇率（USD → CNY）', hint: '卡片金额 = 美元金额 × 本汇率。默认 7.2，改完立即生效（无需重启）。', type: 'number', step: '0.01', min: '0.01' },
+  { name: 'fxRate', label: '汇率（USD → CNY）', hint: '卡片金额 = 美元金额 × 本汇率。改完立即生效（无需重启）。手改过的值不会被自动同步覆盖，直到你点一次「同步」。', type: 'number', step: '0.01', min: '0.01' },
+  { name: 'fxAuto', label: '拉起 dsh 时自动同步汇率', hint: '每次启动 dsh 拉一次实时汇率（三个源取第一个合理值）；拉不到就保留现值，不会把金额算成 0。距上次成功不足 10 分钟则跳过。', type: 'toggle' },
   { name: 'showAmount', label: '显示金额', hint: '若同时装了其它显示金额的插件，可关掉本卡片的金额避免两处口径并存。', type: 'toggle' },
   { name: 'showAttribution', label: '显示上下文占比', hint: '关掉后卡片只保留用量与金额。', type: 'toggle' },
 ]
@@ -455,6 +456,16 @@ function makeSettingsSection(scope) {
       }),
 
       syncMsg === null ? null : h('p', { style: { ...label, margin: '0 0 6px' } }, syncMsg),
+      // 汇率出处：只在「当前汇率就是上次同步写进去的那个值」时才敢这么说（与宿主 fxSnapshot 同一判据）
+      (function fxProvenance() {
+        const at = value.fxSyncedAt
+        const syncedRate = Number(value.fxSyncedRate)
+        const isSynced = typeof at === 'string' && at !== '' && Number.isFinite(syncedRate)
+          && Math.abs(syncedRate - Number(value.fxRate)) < 1e-9
+        if (!isSynced) return null
+        return h('p', { style: { ...label, margin: '0 0 6px' } },
+          '上次同步 ' + String(at).replace('T', ' ').slice(0, 16) + ' · ' + String(value.fxSource || '来源未知') + ' · ' + syncedRate.toFixed(4))
+      })(),
 
       // ---- 费用（价目）----
       h('div', { style: { marginTop: '12px', paddingTop: '10px', borderTop: '1px solid ' + HAIRLINE } },
