@@ -29,6 +29,7 @@
  */
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, statSync } from 'node:fs'
 import { join } from 'node:path'
+import { localDay } from './report.mjs'
 
 export const LEDGER_SCHEMA_VERSION = 1
 /** 攒够这么多行就立刻落盘，不等防抖。 */
@@ -56,6 +57,9 @@ export function rowKey(row) {
 }
 
 /** 一行是不是一条合法账本行（形状不对就当坏行丢掉，别让半个对象进来）。 */
+/** 账本行自带的版本号：将来改行结构时用它判断怎么读。 */
+export const ROW_SCHEMA_VERSION = LEDGER_SCHEMA_VERSION
+
 export function isLedgerRow(o) {
   if (o === null || typeof o !== 'object') return false
   if (typeof o.sessionId !== 'string' || o.sessionId === '') return false
@@ -105,13 +109,6 @@ export function readMonthFile(path) {
     else rows.push(row)
   }
   return { rows, badLines, missing: false }
-}
-
-/** 本地日（报告按人看的「天」分桶，与 report.mjs 同口径）。 */
-function localDay(ms) {
-  const d = new Date(ms)
-  const pad = (n) => String(n).padStart(2, '0')
-  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
 }
 
 /**
@@ -182,7 +179,7 @@ export function foldRows(rows) {
  * 任何 IO 失败都只记一条 warn 并保持原样：账本是缓存，坏了顶多回到「走日志回填」。
  * @param deps - { home, pid, now, debounceMs, maxBuffer, onWarn }
  */
-export function createLedger({ home, pid = process.pid, now = () => Date.now(), debounceMs = LEDGER_DEBOUNCE_MS, maxBuffer = LEDGER_MAX_BUFFER, onWarn = null } = {}) {
+export function createLedger({ home, pid = process.pid, debounceMs = LEDGER_DEBOUNCE_MS, maxBuffer = LEDGER_MAX_BUFFER, onWarn = null } = {}) {
   const dir = ledgerDir(home)
   const buffer = []
   /** 文件路径 → { mtimeMs, size, rows } */
@@ -190,6 +187,11 @@ export function createLedger({ home, pid = process.pid, now = () => Date.now(), 
   let timer = null
   let warnings = 0
   let written = 0
+  /** 写盘失败而**丢掉**的行数。丢掉就丢掉，但绝不能不吭声 —— 那是少算钱。 */
+  let lost = 0
+
+  /** 缓存上限：账本一年也就十来个月份文件，超过这个数说明另有情况，全清防止常驻涨内存。 */
+  const FILE_CACHE_MAX = 64
 
   const warn = (message) => {
     warnings += 1
@@ -240,7 +242,8 @@ export function createLedger({ home, pid = process.pid, now = () => Date.now(), 
         written += rows.length
         fileCache.delete(file)   // 这份文件变了，缓存作废
       } catch (error) {
-        warn('ledger append failed (' + month + '): ' + String(error?.message ?? error))
+        lost += rows.length
+        warn('ledger append failed (' + month + ')，这 ' + rows.length + ' 行没进账本（会退回日志重放）：' + String(error?.message ?? error))
       }
     }
     return n
@@ -292,6 +295,7 @@ export function createLedger({ home, pid = process.pid, now = () => Date.now(), 
     if (hit !== undefined && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.rows
     const res = readMonthFile(file.path)
     if (res.badLines > 0) warn('ledger skipped ' + res.badLines + ' bad line(s) in ' + file.name)
+    if (fileCache.size >= FILE_CACHE_MAX) fileCache.clear()
     fileCache.set(file.path, { mtimeMs: st.mtimeMs, size: st.size, rows: res.rows })
     return res.rows
   }
@@ -314,7 +318,7 @@ export function createLedger({ home, pid = process.pid, now = () => Date.now(), 
   /** 账本自述：目录、已写行数、缓冲、文件数、警告数。 */
   const stats = () => {
     const files = listFiles()
-    return { dir, written, buffered: buffer.length, files: files.length, months: new Set(files.map((f) => f.month)).size, warnings }
+    return { dir, written, buffered: buffer.length, files: files.length, months: new Set(files.map((f) => f.month)).size, warnings, lost }
   }
 
   /** 清空内存缓存（测试用；不动磁盘）。 */

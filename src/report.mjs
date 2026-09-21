@@ -67,8 +67,8 @@ export function listSessionLogs(home = process.env.DSH_HOME ?? join(homedir(), '
   return found
 }
 
-/** 本地日期：报告按人看的「天」分桶，不是 UTC 天。 */
-function localDay(ms) {
+/** 本地日期：报告按人看的「天」分桶，不是 UTC 天。账本分桶也复用它。 */
+export function localDay(ms) {
   const d = new Date(ms)
   const pad = (n) => String(n).padStart(2, '0')
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
@@ -229,10 +229,19 @@ export function renderMarkdown(report) {
     lines.push('|---|---|---|')
     lines.push('| 账本（写入时定价，已冻结） | ' + report.ledger.turns + ' | ¥' + report.ledger.cny.toFixed(4) + ' |')
     lines.push('| 当前价重算（上表即此口径） | ' + report.turns + ' | ¥' + report.cny.toFixed(4) + ' |')
-    lines.push('| 差异 | ' + (report.ledger.turns - report.turns) + ' | ' + sign + '¥' + Math.abs(diff).toFixed(4) + ' |')
-    lines.push('')
-    lines.push('> 差异来自官方调价或价表覆盖：账本里的历史轮次按**写入当时**的价目计价，不随价表变化而漂移；')
-    lines.push('> 上表则一律按当前价表重算。账本只服务侧栏卡片，报告仍以日志为权威。')
+    const unpriced = report.ledger.unpricedTurns
+    if (unpriced > 0) {
+      // 有未定价轮次时账本金额是**下界**，差值会假装"账本更便宜 = 官方降价"，方向性错误。
+      lines.push('| 差异 | ' + (report.ledger.turns - report.turns) + ' | 不可比 |')
+      lines.push('')
+      lines.push('> 账本里有 ' + unpriced + ' 轮未定价（价表缺对应模型），账本金额只是下界，所以这一版不给差值 ——')
+      lines.push('> 否则会把"缺价"算成"官方调价"。')
+    } else {
+      lines.push('| 差异 | ' + (report.ledger.turns - report.turns) + ' | ' + sign + '¥' + Math.abs(diff).toFixed(4) + ' |')
+      lines.push('')
+      lines.push('> 差值只来自两处：账本里的历史轮次按**写入当时**的价目计价（不随调价漂移），而上表一律按当前价表重算；')
+      lines.push('> 两边的会话范围也可能不同（本报告的会话筛选 / 是否含子代理）。账本只服务侧栏卡片，报告仍以日志为权威。')
+    }
     lines.push('')
   }
   lines.push('## 按天')

@@ -162,7 +162,9 @@ function textOf(node) {
   if (typeof node === 'string' || typeof node === 'number') return String(node)
   if (Array.isArray(node)) return node.map(textOf).join(' ')
   if (typeof node !== 'object') return ''
-  return [textOf(node.props?.children), textOf(node.children)].join(' ')
+  // title 也算"用户看得到的东西"（悬停提示）—— 例如 rail 态那个环只用 title 说明状态，
+  // 漏掉它就会把"老实降级"误判成"白屏"。
+  return [textOf(node.props?.title), textOf(node.props?.children), textOf(node.children)].join(' ')
 }
 
 const slots = []
@@ -202,13 +204,19 @@ clientExports.apply(fakeCtx)
 const cardSlot = slots.find((s) => s.spec.id === 'usage-card' && s.spec.name === 'sidebar.footer.action')
 await t('卡片组件注册进 sidebar.footer.action', () => assert.ok(cardSlot && typeof cardSlot.comp === 'function'))
 
-/** 渲染一次卡片（宽/窄两态；宽态再指定明细展开与否），返回合并后的文本。 */
+/** 宽态（展开的面板）单独渲染 —— 宽窄两条路径的护栏必须分别断言，混在一起会漏掉一侧。 */
+function renderWide(payload, error, detailOpen = false) {
+  stateQueue = [{ loading: false, data: payload, error }, detailOpen]
+  return textOf(renderNode(cardSlot.comp({ wide: true })))
+}
+/** 窄态（rail 里的环）单独渲染。 */
+function renderNarrow(payload, error) {
+  stateQueue = [{ loading: false, data: payload, error }, false]
+  return textOf(renderNode(cardSlot.comp({ wide: false })))
+}
+/** 两态合并文本（给"不抛"这类整体断言用）。 */
 function renderCard(payload, error, detailOpen = false) {
-  stateQueue = [{ loading: false, data: payload, error }, detailOpen]
-  const wide = renderNode(cardSlot.comp({ wide: true }))
-  stateQueue = [{ loading: false, data: payload, error }, detailOpen]
-  const narrow = renderNode(cardSlot.comp({ wide: false }))
-  return textOf(wide) + ' | ' + textOf(narrow)
+  return renderWide(payload, error, detailOpen) + ' | ' + renderNarrow(payload, error)
 }
 
 // 形状完整、可定价的 payload —— 三段折叠（Q1=B）的正例
@@ -243,13 +251,29 @@ const EVIL = [
 
 for (const [label, payload, expect] of EVIL) {
   await t('渲染不抛：' + label, () => {
-    const text = renderCard(payload, undefined, false) + ' ' + renderCard(payload, undefined, true)
+    const wide = renderWide(payload, undefined, false)
+    const narrow = renderNarrow(payload, undefined)
+    const text = wide + ' | ' + narrow
     assert.ok(text.length > 0, '应该有输出')
-    if (expect === 'schema') assert.match(text, /不认识|渲染失败/, '应报结构不认识：' + text.slice(0, 80))
+    if (expect === 'schema') {
+      assert.match(wide, /不认识/, '宽态应报结构不认识：' + wide.slice(0, 80))
+      // 窄态（rail 的环）此前没有形状闸，会由渲染边界兜成"渲染失败"整块消失 ——
+      // 卡片没崩，但那一格白屏。现在两条路径共用同一道闸，窄态应老实降级成空环。
+      assert.doesNotMatch(narrow, /已隔离|渲染失败/, '窄态不该退化成渲染失败：' + narrow.slice(0, 80))
+    }
     if (expect === 'degraded') assert.match(text, /不可用/, '应走降级文案：' + text.slice(0, 80))
     if (expect === 'boundary') assert.match(text, /已隔离/, '应由渲染边界兜住：' + text.slice(0, 80))
   })
 }
+await t('形状不对时窄态渲染的是环（有 title 提示），不是空白', () => {
+  const narrow = renderNarrow({ ok: true, session: {} }, undefined)
+  assert.match(narrow, /暂无数据/, '形状闸没过时应显示"暂无数据"：' + narrow.slice(0, 60))
+})
+await t('形状对时窄态照常出环（命中率与金额）', () => {
+  const narrow = renderNarrow(VALID, undefined)
+  assert.match(narrow, /99%/, '环下应有命中率：' + narrow.slice(0, 60))
+  assert.match(narrow, /¥0\.55/, '环下应有金额：' + narrow.slice(0, 60))
+})
 
 console.log('客户端半 · 三段折叠（Q1=B）')
 await t('默认收起：只出占比总量与展开入口，不渲染逐项明细', () => {

@@ -212,9 +212,12 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
  */
 export function localFenceRejection(req) {
   const peer = req?.socket?.remoteAddress
-  if (typeof peer === 'string' && peer !== '' && !LOOPBACK.has(peer)) return 403
+  // **fail closed**：连对端地址都看不到就不放行（注释写的是"对端必须是回环"，
+  // 而"看得见才检查"等于给了未知传输一条后门）。真实 HTTP 请求一定带 remoteAddress。
+  if (typeof peer !== 'string' || peer === '') return 403
+  if (!LOOPBACK.has(peer)) return 403
   const host = String(req?.headers?.host ?? '')
-  if (host === '') return undefined
+  if (host === '') return 403
   const hostname = host.replace(/^\[/, '').replace(/\]:\d+$/, '').replace(/:\d+$/, '')
   if (hostname !== 'localhost' && !LOOPBACK.has(hostname)) return 403
   return undefined
@@ -826,6 +829,10 @@ export function apply(ctx) {
     folds.set(id, fold)
     // 落盘：金额在**此刻**算定，连同当时用的价目版本一起冻结。此后再不重算 ——
     // 官方调价只影响之后的轮次，历史金额不跟着漂（这是账本存在的首要理由）。
+    //
+    // 没有 seq 的事件（宿主改了事件形态、或某些派生的用量事件）**不落盘**：账本的幂等键就是
+    // (sessionId, seq)，没有键就没法保证重放不翻倍。这类轮次仍会进内存 fold（金额照算），
+    // 只是重启后由日志回填重算 —— 也就是"没被冻结"。宁可少冻结，不要重复计数。
     if (seq !== null) {
       ledger.append({
         sessionId: id,
@@ -857,9 +864,13 @@ export function apply(ctx) {
     backfilled.add(id)
     // 1) 先吃账本：命中的轮次直接用**当时算定的金额**，不重算也不读日志。
     //    读不出来就当没有（账本是缓存，坏了顶多回到走日志）。
+    // 会话自己说它最后一条事件的 seq 是多少 —— 账本里的行不许超过它（见下面第 2 步的说明）
+    const endSeq = Number(session.seq)
     let throughSeq = null
+    let overSeq = 0
     try {
       for (const row of ledger.load(id)) {
+        if (Number.isFinite(endSeq) && row.seq > endSeq) { overSeq += 1; continue }
         if (throughSeq === null || row.seq > throughSeq) throughSeq = row.seq
         const key = rowKey(row)
         if (turnKeys.has(key)) continue
@@ -885,9 +896,17 @@ export function apply(ctx) {
       try { ctx.logger?.warn?.('usage-card: 账本读取失败，退回日志回填：' + String(error?.message ?? error)) } catch { /* 同上 */ }
     }
     // 2) 日志只补账本没覆盖的部分；账本已经覆盖到会话末尾时，**一次日志都不读**。
-    const endSeq = Number(session.seq)
-    if (throughSeq !== null && Number.isFinite(endSeq) && endSeq <= throughSeq) return
-    const startAfter = throughSeq === null ? 0 : throughSeq + 1
+    //
+    // **水位不许超过会话自己的 seq**：账本里混进一条 seq 异常但形状合法的行（改过 seq 语义、
+    // 手工拼回旧 pid 的文件、会话 id 复用）时，超出的水位会让这个会话**永远不再读日志** ——
+    // 真实轮次既不进账本也不被回填，金额静默少算，卡片却照常显示。多读一遍日志的代价只是
+    // 几毫秒，重复的轮次会被 turnKeys 去重；**多读是安全的，少读不是**。
+    if (overSeq > 0) {
+      try { ctx.logger?.warn?.('usage-card: 账本里有 ' + overSeq + ' 行 seq 超过会话末尾（会话 ' + id + '，末尾 ' + endSeq + '），已忽略这些行并回读日志') } catch { /* 日志不可用不影响 */ }
+    }
+    const covered = throughSeq !== null && Number.isFinite(endSeq) ? throughSeq : null
+    if (covered !== null && endSeq <= covered) return
+    const startAfter = covered === null ? 0 : covered + 1
     let events = null
     try {
       const maybe = session.events
@@ -1073,7 +1092,10 @@ export function apply(ctx) {
         unpricedTurns += folded.unpricedTurns
       }
       if (turns > 0) ledgerTotals = { turns, usd, unpricedTurns }
-    } catch { ledgerTotals = null }
+    } catch (error) {
+      ledgerTotals = null
+      try { ctx.logger?.warn?.('usage-card: 报告读账本失败，这一版不给对照：' + String(error?.message ?? error)) } catch { /* 同上 */ }
+    }
     const report = buildReport(sessions, {
       fxRate: settings.fxRate,
       generatedAt: new Date().toISOString(),

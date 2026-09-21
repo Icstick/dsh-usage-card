@@ -303,6 +303,45 @@ try {
   rmSync(homeX, { recursive: true, force: true })
 }
 
+console.log('P0 回归：账本里的异常 seq 不许永久挡住日志')
+{
+  const homeA = tmp('clean')
+  const homeB = tmp('badseq')
+  const saved = process.env.DSH_HOME
+  try {
+    // A：干净账本（走日志回填）→ 记下此刻的"正确答案"
+    process.env.DSH_HOME = homeA
+    const readsA = { n: 0 }
+    const ctxA = makeCtx(makeSession({ reads: readsA, withEvents: true }), [])
+    apply(ctxA)
+    const payloadA = await probe(ctxA)
+
+    // B：账本里混进一条 seq 远大于会话末尾的行（改过 seq 语义 / 手工拼回旧 pid 文件 / 会话 id 复用）
+    process.env.DSH_HOME = homeB
+    const led = createLedger({ home: homeB })
+    led.append(row(999999, Date.UTC(2026, 8, 21, 1), { sessionId: SESSION_ID }))
+    led.flush()
+    const readsB = { n: 0 }
+    const ctxB = makeCtx(makeSession({ reads: readsB, withEvents: true }), [])
+    apply(ctxB)
+    const payloadB = await probe(ctxB)
+
+    await t('异常水位被忽略：日志照读，不去信那个 seq', () => {
+      assert.ok(readsB.n > 0, '必须回读日志 —— 之前这里会因为水位 999999 直接 return')
+      assert.equal(payloadB.cost.pricing.turns, 2, '真实的两轮要算进来')
+      assert.equal(payloadB.cost.pricing.mode, 'per-turn')
+    })
+    await t('金额与干净账本一致（异常行既不挡日志也不被折进账）', () => {
+      assert.equal(payloadB.cost.totalCny, payloadA.cost.totalCny)
+      assert.ok(payloadA.cost.totalCny > 0)
+    })
+  } finally {
+    if (saved === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = saved
+    rmSync(homeA, { recursive: true, force: true })
+    rmSync(homeB, { recursive: true, force: true })
+  }
+}
+
 console.log('')
 if (failures.length > 0) {
   console.log('账本验收：失败 ' + failures.length + ' 项 —— ' + failures.join(' / '))
