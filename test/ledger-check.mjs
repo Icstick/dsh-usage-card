@@ -25,7 +25,10 @@ const t = async (name, fn) => {
   catch (e) { failures.push(name); console.log('  FAIL ' + name + ' → ' + (e?.message ?? e)) }
 }
 const tmp = (tag) => mkdtempSync(join(tmpdir(), 'ledger-' + tag + '-'))
-const ledgerFile = (home, month) => join(home, 'storages', 'dsh-usage-card', 'ledger', month + '.jsonl')
+const ledgerDirOf = (home) => join(home, 'storages', 'dsh-usage-card', 'ledger')
+/** 账本文件名带写入进程的 pid：<月份>.<pid>.jsonl（同一个月允许多进程各写各的）。 */
+const ledgerFile = (home, month, pid = process.pid) => join(ledgerDirOf(home), month + '.' + pid + '.jsonl')
+const ledgerFilesOf = (home) => readdirSync(ledgerDirOf(home))
 
 const row = (seq, time, over = {}) => ({
   sessionId: 'session-test', seq, time, model: 'deepseek-flash', tier: 'offpeak',
@@ -67,7 +70,38 @@ console.log('1) 幂等')
     assert.equal(once.turns, 3)
     assert.equal(twice.turns, 3, '写两遍不能变成 6 轮')
     assert.equal(twice.usd, once.usd)
-    assert.equal(readdirSync(join(home, 'storages', 'dsh-usage-card', 'ledger')).length, 1, '同月只应有一个文件')
+    assert.equal(ledgerFilesOf(home).length, 1, '同月只应有一个文件')
+    assert.match(ledgerFilesOf(home)[0], /^2026-09\.\d+\.jsonl$/, '文件名应带写入进程的 pid')
+  })
+  rmSync(home, { recursive: true, force: true })
+}
+
+console.log('1b) 同一个月多进程各写各的文件')
+{
+  const home = tmp('multiproc')
+  await t('两个"进程"写同一轮 → 读时按 (sessionId,seq) 去重，不翻倍', () => {
+    // 模拟同一个月两个 dsh 进程（web / worker）共用同一个 DSH_HOME
+    const a = createLedger({ home, pid: 111 })
+    const b = createLedger({ home, pid: 222 })
+    a.append(row(1, Date.UTC(2026, 8, 21, 1)))
+    a.append(row(2, Date.UTC(2026, 8, 21, 2)))
+    b.append(row(2, Date.UTC(2026, 8, 21, 2)))   // 同一轮，另一个进程也看到了
+    b.append(row(3, Date.UTC(2026, 8, 21, 3)))
+    a.flush()
+    b.flush()
+    assert.equal(ledgerFilesOf(home).length, 2, '两个进程各写各的文件')
+    const merged = foldRows(a.load('session-test'))
+    assert.equal(merged.turns, 3, '2 + 2 行去重后是 3 轮，不是 4')
+    assert.equal(foldRows(b.load('session-test')).turns, 3, '另一侧读到的也一样')
+  })
+  await t('别的进程刚写进去的行，本进程下一次读就能看见（mtime 失效）', () => {
+    const a = createLedger({ home, pid: 111 })
+    const b = createLedger({ home, pid: 333 })
+    assert.equal(a.load('session-test').length, 3)
+    a.load('session-test')                       // 先把缓存坐实
+    b.append(row(9, Date.UTC(2026, 8, 21, 9)))
+    b.flush()
+    assert.equal(a.load('session-test').length, 4, '不能一直用陈旧快照')
   })
   rmSync(home, { recursive: true, force: true })
 }
@@ -223,7 +257,8 @@ try {
   await new Promise((r) => setTimeout(r, 450))   // 让防抖落盘
 
   await t('实时事件被记进账本（按月落盘，含金额与价目版本）', () => {
-    assert.deepEqual(readdirSync(join(homeX, 'storages', 'dsh-usage-card', 'ledger')), ['2026-09.jsonl'])
+    assert.equal(ledgerFilesOf(homeX).length, 1)
+    assert.match(ledgerFilesOf(homeX)[0], /^2026-09\.\d+\.jsonl$/)
     const rows = readMonthFile(ledgerFile(homeX, '2026-09')).rows
     assert.equal(rows.length, 2, '两条 assistant/message 各一行')
     assert.equal(rows[0].sessionId, SESSION_ID)

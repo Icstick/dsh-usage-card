@@ -760,8 +760,14 @@ export function apply(ctx) {
     home: process.env.DSH_HOME ?? join(homedir(), '.dsh'),
     onWarn: (message) => { try { ctx.logger?.warn?.('usage-card: ' + message) } catch { /* 日志不可用不影响 */ } },
   })
-  /** 已记过的轮次键（sessionId#seq）：回填与实时事件交叠时靠它幂等。 */
+  /**
+   * 已记过的轮次键（sessionId#seq）：回填与实时事件交叠时靠它幂等。
+   * 去重只需要挡住"同一轮被记两次"，而那只发生在同一时刻的实时事件与回填之间 ——
+   * 所以键不必无限留着：超过上限就按插入顺序丢掉最旧的一批（长驻进程别在这儿慢慢涨内存）。
+   */
   const turnKeys = new Set()
+  const TURN_KEYS_MAX = 200000
+  const TURN_KEYS_KEEP = 100000
   /** 已经回填过的会话（回填是 O(事件数)，每个会话只做一次）。 */
   const backfilled = new Set()
   /** 会话 id → 最近一次请求的模型（逐轮定价要用当时那个模型的价）。 */
@@ -788,6 +794,10 @@ export function apply(ctx) {
     const key = seq === null ? id + '@' + time : id + '#' + seq
     if (turnKeys.has(key)) return
     turnKeys.add(key)
+    if (turnKeys.size > TURN_KEYS_MAX) {
+      let drop = turnKeys.size - TURN_KEYS_KEEP
+      for (const k of turnKeys) { turnKeys.delete(k); drop -= 1; if (drop <= 0) break }
+    }
     const buckets = {
       uncachedInputTokens: usage.inputTokens ?? 0,
       cacheReadTokens: usage.cacheReadTokens ?? 0,
@@ -905,6 +915,10 @@ export function apply(ctx) {
       }
     }
   }
+
+  // 进程被回收时把缓冲里剩的那几行落盘：防抖窗口内退出最多丢 300ms 的量（账本是缓存，
+  // 丢了也能从日志重放，但能顺手落盘就别丢）。
+  ctx.effect(() => () => { try { ledger.flush() } catch { /* 退出路径不抛 */ } }, 'usage-card: ledger flush on dispose')
 
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
@@ -1035,8 +1049,9 @@ export function apply(ctx) {
    * @param only - 只导出这些会话 id（null = 全部）
    */
   const reportFor = (format, settings, only = null, includeSubagents = false) => {
-    // 账本行数进缓存键：账本长起来了，对照那一行也得跟着变
-    const key = format + '|' + settings.fxRate + '|' + (only == null ? '*' : only.join(',')) + '|' + (includeSubagents ? 'sub' : 'user') + '|' + ledger.stats().written
+    // 账本行数进缓存键：账本长起来了，对照那一行也得跟着变（含还在缓冲、没落盘的那部分）
+    const ledgerStats = ledger.stats()
+    const key = format + '|' + settings.fxRate + '|' + (only == null ? '*' : only.join(',')) + '|' + (includeSubagents ? 'sub' : 'user') + '|' + ledgerStats.written + '+' + ledgerStats.buffered
     const now = Date.now()
     const cached = reportCache.get(key)
     if (cached !== undefined && now - cached.at < REPORT_TTL_MS) return cached

@@ -61,8 +61,8 @@ cost.totalCny = ¥1.4571
 $DSH_HOME/storages/dsh-usage-card/
   prices-override.json            ← 已有
   ledger/
-    2026-09.jsonl                 ← 按「轮次发生的月份」分文件，追加写
-    2026-10.jsonl
+    2026-09.<pid>.jsonl           ← 按「轮次发生的月份」分文件，追加写；<pid> = 写它的进程
+    2026-10.<pid>.jsonl
     index.json                    ← { schemaVersion, machineId, rows, bytes, lastWriteAt, months:[…] }
 ```
 
@@ -126,7 +126,7 @@ $DSH_HOME/storages/dsh-usage-card/
 
 步骤（每台机一遍）：
 
-1. **确认设备与 profile**：A 机 `web`；B 机 `worker` / `web` / <另一账户> 的 `web`（共 3 个 profile）。
+1. **确认设备与 profile**：目标机上每个要显示的 profile 各装一次（本机实测 3 个 profile）。
 2. **更新到本次提交**：`pwsh -File install-usage-card.ps1`（脚本自带校验：`dependencies` / `bundles` / `lib/client.js` 三处齐了才算装好）。
    ⚠️ **预检**：`github:` 安装是按提交/引用解析的，版本号不变时可能命中缓存。所以**建议先 bump 到 0.12.0 再装**；否则要显式带 commit。
 3. **重启该 profile 的 dsh**（宿主半改动必须重启；客户端半刷新即可）。
@@ -152,7 +152,12 @@ $DSH_HOME/storages/dsh-usage-card/
 | M6-a 账本写入 + 读取 + 幂等 | ✅ | 见下 |
 | M6-b 价格冻结 + 报告对照 | ✅ | 对照表只出现在 Markdown（CSV 是纯数据表，不加人读的注脚） |
 | M6-c 报告改用账本快照 | 不做 ✅（已拍） | — |
-| B 机验证 | ✅ | 装在 <另一账户> home（B 的 dsh 用 `DSH_HOME=C:\Users\<user>\.dsh` 启动），不是 worker home |
+| 异机验证（B 机） | ✅ | 该机的 dsh 用**非默认 DSH_HOME** 启动（启动脚本里写死），插件要装进那个 home，不是当前登录用户的 home |
+
+**文件名带 pid（实现时补的决定）**：同一个 DSH_HOME 会被多个 dsh 进程共用（web / worker / headless 各起一份）。
+两个进程同时往一个文件追加会互相插行，拼接出来的行解析失败就当坏行丢掉 —— 那是静默少算钱。按进程分文件后
+这一类彻底不存在，且同一轮被两边各记一次也能在读时按 `(sessionId, seq)` 去重。文件读取按 (mtime, size) 判缓存，
+所以别的进程刚写进去的行，本进程下一次读就看得见。
 
 **刻意不做 index.json**：月份文件只有几个，全量扫描是几十毫秒；多一份索引就多一个可能与事实不符的第二真相源。
 会话读取因此是"扫所有月份文件 + 命中过滤"，本机 3.4k 行量级完全够用。

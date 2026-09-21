@@ -7,14 +7,20 @@
  *      官方调价只影响之后的轮次，不会让历史金额跟着漂；
  *   3. 历史可查：按会话/按天/按模型的明细不必现场折叠日志。
  *
- * 三条硬纪律：
+ * 四条硬纪律：
  *   - **幂等键 = (sessionId, seq)**，同键后写覆盖。重放、回填、实时事件交叠都不会重复计数。
- *   - **投影仍是权威**：账本只影响"逐轮归属"，四桶总量永远以内核投影为准；账本少算的部分照旧
+ *   - **投影仍是权威**：账本只影响「逐轮归属」，四桶总量永远以内核投影为准；账本少算的部分照旧
  *     走线性估算并如实标注 coverage —— 账本只减少「未覆盖」，不粉饰它。
- *   - **坏了不能带走卡片**：坏行跳过、文件读不出就整月放弃，任何 IO 异常都只记一条 warn。
+ *   - **坏了不能带走卡片**：坏行跳过、文件读不出就整份放弃，任何 IO 异常都只记一条 warn。
+ *   - **同一个月允许多个进程各写各的文件**（见下）。
  *
  * 文件布局（按**轮次发生的月份**分，UTC；跨月回填也不会写错文件）：
- *   <DSH_HOME>/storages/dsh-usage-card/ledger/2026-09.jsonl
+ *   <DSH_HOME>/storages/dsh-usage-card/ledger/2026-09.<pid>.jsonl
+ *
+ * **为什么文件名带 pid**：同一个 DSH_HOME 可能被多个 dsh 进程同时使用（web / worker / headless
+ * 各起一份；换用户跑的话还会各有一套 home 目录）。两个进程同时往一个文件追加，行与行会互相插进去 —— 拼接出
+ * 来的行解析失败就会被当坏行丢掉，那是**静默少算钱**。按进程分文件之后这一类彻底不存在：
+ * 各写各的文件，同一个轮次被两个进程各记一次也没关系，读取时按 (sessionId, seq) 去重。
  *
  * 刻意不做 index.json：月份文件只有几个，全量扫描的代价是几十毫秒；多一份索引就多一个
  * 可能与事实不符的第二真相源。
@@ -40,6 +46,9 @@ export function monthKeyOf(timeMs) {
   const d = new Date(timeMs)
   return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0')
 }
+
+/** 账本文件名的形状：<月份>[.<写它的进程>].jsonl —— 月份由 1 号捕获组给出。 */
+export const LEDGER_FILE_RE = /^(\d{4}-\d{2})(?:\.[A-Za-z0-9_-]+)?\.jsonl$/
 
 /** 幂等键：同一个会话的同一个 seq 就是同一轮。 */
 export function rowKey(row) {
@@ -77,7 +86,7 @@ export function dedupeRows(rows) {
 }
 
 /**
- * 读一个月份文件。文件不存在不算错（返回 missing）。
+ * 读一个账本文件。文件不存在不算错（返回 missing）。
  * @param path - 文件路径
  */
 export function readMonthFile(path) {
@@ -165,16 +174,19 @@ export function foldRows(rows) {
  * 账本写入器/读取器。
  *
  * 写入：进缓冲 → 攒够 maxBuffer 立即落盘，否则防抖 debounceMs 后落盘。
- *       一次 flush 按月份分组、每组一次 appendFileSync（原子追加，不重写整文件）。
- * 读取：按会话取行；月份文件解析结果缓存在内存（同一进程内不重复读盘）。
+ *       一次 flush 按月份分组，每组一次 appendFileSync（只追加，不重写整文件）。
+ *       文件名带 pid：同一个 home 被多个 dsh 进程共用时，各写各的文件，行不会互相插进去。
+ * 读取：按会话取行；每个文件的解析结果按 (mtimeMs, size) 缓存 —— 别的进程刚写进去的行，
+ *       下一次读就会看见（同一进程内不重复读盘，但也不会一直用陈旧快照）。
  *
- * 任何 IO 失败都只记一条 warn 并保持原样：账本是缓存，坏了顶多回到"走日志回填"。
- * @param deps - { home, now, debounceMs, maxBuffer, onWarn }
+ * 任何 IO 失败都只记一条 warn 并保持原样：账本是缓存，坏了顶多回到「走日志回填」。
+ * @param deps - { home, pid, now, debounceMs, maxBuffer, onWarn }
  */
-export function createLedger({ home, now = () => Date.now(), debounceMs = LEDGER_DEBOUNCE_MS, maxBuffer = LEDGER_MAX_BUFFER, onWarn = null } = {}) {
+export function createLedger({ home, pid = process.pid, now = () => Date.now(), debounceMs = LEDGER_DEBOUNCE_MS, maxBuffer = LEDGER_MAX_BUFFER, onWarn = null } = {}) {
   const dir = ledgerDir(home)
   const buffer = []
-  const monthCache = new Map()
+  /** 文件路径 → { mtimeMs, size, rows } */
+  const fileCache = new Map()
   let timer = null
   let warnings = 0
   let written = 0
@@ -206,7 +218,7 @@ export function createLedger({ home, now = () => Date.now(), debounceMs = LEDGER
     }
   }
 
-  /** 把缓冲里的行写进对应月份文件。 */
+  /** 把缓冲里的行写进对应月份文件。返回写成功的行数。 */
   const flush = () => {
     if (timer !== null) { clearTimeout(timer); timer = null }
     if (buffer.length === 0) return 0
@@ -222,12 +234,11 @@ export function createLedger({ home, now = () => Date.now(), debounceMs = LEDGER
     for (const [month, rows] of byMonth) {
       try {
         mkdirSync(dir, { recursive: true })
-        const file = join(dir, month + '.jsonl')
+        const file = join(dir, month + '.' + pid + '.jsonl')
         appendFileSync(file, needsSeal(file) + rows.map(encodeRow).join(''), 'utf8')
         n += rows.length
         written += rows.length
-        // 缓存失效：这一份月份文件已经变了
-        monthCache.delete(month)
+        fileCache.delete(file)   // 这份文件变了，缓存作废
       } catch (error) {
         warn('ledger append failed (' + month + '): ' + String(error?.message ?? error))
       }
@@ -251,48 +262,67 @@ export function createLedger({ home, now = () => Date.now(), debounceMs = LEDGER
     return true
   }
 
-  /** 读某个月份文件（带内存缓存）。 */
-  const month = (key) => {
-    if (monthCache.has(key)) return monthCache.get(key)
-    const res = readMonthFile(join(dir, key + '.jsonl'))
-    if (res.badLines > 0) warn('ledger skipped ' + res.badLines + ' bad line(s) in ' + key + '.jsonl')
-    monthCache.set(key, res.rows)
+  /** 列出账本文件（含其它进程写的）。目录不存在 = 全新安装，不是错误。 */
+  const listFiles = () => {
+    let names
+    try {
+      names = readdirSync(dir)
+    } catch {
+      return []
+    }
+    const out = []
+    for (const name of names) {
+      const m = LEDGER_FILE_RE.exec(name)
+      if (m === null) continue
+      out.push({ name, month: m[1], path: join(dir, name) })
+    }
+    return out.sort((a, b) => (a.name < b.name ? -1 : 1))
+  }
+
+  /** 读一个文件（按 mtime+size 判缓存是否还能用）。 */
+  const readCached = (file) => {
+    let st
+    try {
+      st = statSync(file.path)
+    } catch {
+      fileCache.delete(file.path)
+      return []
+    }
+    const hit = fileCache.get(file.path)
+    if (hit !== undefined && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.rows
+    const res = readMonthFile(file.path)
+    if (res.badLines > 0) warn('ledger skipped ' + res.badLines + ' bad line(s) in ' + file.name)
+    fileCache.set(file.path, { mtimeMs: st.mtimeMs, size: st.size, rows: res.rows })
     return res.rows
   }
 
-  /** 列出账本里的月份（文件名即月份）。 */
-  const months = () => {
-    try {
-      return readdirSync(dir).filter((n) => /^\d{4}-\d{2}\.jsonl$/.test(n)).map((n) => n.slice(0, 7)).sort()
-    } catch {
-      return []   // 目录还不存在 = 全新安装，不是错误
-    }
-  }
-
   /**
-   * 取某个会话的全部行（已去重）。
-   * 未落盘的在缓冲里也要算上，否则"刚聊完重启前"的那几轮会读不到。
+   * 取某个会话的全部行（已去重、按 seq 排序）。
+   * 还没落盘的行（缓冲里）也算上，否则「刚聊完、重启前」那几轮会读不到。
    * @param sessionId - 会话 id
    */
   const load = (sessionId) => {
     if (typeof sessionId !== 'string' || sessionId === '') return []
     const rows = []
-    for (const key of months()) {
-      for (const row of month(key)) if (row.sessionId === sessionId) rows.push(row)
+    for (const file of listFiles()) {
+      for (const row of readCached(file)) if (row.sessionId === sessionId) rows.push(row)
     }
     for (const row of buffer) if (row.sessionId === sessionId) rows.push(row)
     return dedupeRows(rows).sort((a, b) => a.seq - b.seq)
   }
 
-  /** 账本自述：目录、已写行数、缓冲、月份数、警告数。 */
-  const stats = () => ({ dir, written, buffered: buffer.length, months: months().length, warnings })
+  /** 账本自述：目录、已写行数、缓冲、文件数、警告数。 */
+  const stats = () => {
+    const files = listFiles()
+    return { dir, written, buffered: buffer.length, files: files.length, months: new Set(files.map((f) => f.month)).size, warnings }
+  }
 
   /** 清空内存缓存（测试用；不动磁盘）。 */
   const reset = () => {
     if (timer !== null) { clearTimeout(timer); timer = null }
     buffer.length = 0
-    monthCache.clear()
+    fileCache.clear()
   }
 
-  return { dir, append, load, flush, stats, reset, months }
+  return { dir, append, load, flush, stats, reset, listFiles }
 }
