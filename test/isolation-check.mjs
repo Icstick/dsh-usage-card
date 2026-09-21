@@ -172,10 +172,32 @@ const fakeCtx = {
   },
   settingsScope: { bind: () => ({ subscribe: () => () => {}, getSnapshot: () => ({}), set: () => {} }) },
 }
-const mod = { exports: {} }
-new Function('require', 'module', 'exports', src)((name) => (name === 'react' ? makeFakeReact() : {}), mod, mod.exports)
-await t('客户端模块可加载且暴露 apply', () => assert.equal(typeof mod.exports.apply, 'function'))
-mod.exports.apply(fakeCtx)
+// 优先跑**构建产物** lib/client.js（那才是真正发出去、真正装在侧栏里的东西）：
+// 只跑源码的话，忘了重建 bundle 也能全绿 —— 这正是别的插件踩过的坑。
+const bundleSrc = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+let clientExports = null
+let loadedFrom = null
+{
+  let captured = null
+  new Function('window', bundleSrc)({ __ModuleLoader__: { load: (reg) => { captured = reg } } })
+  if (captured && captured.id === 'dsh-usage-card' && typeof captured.factory === 'function') {
+    clientExports = captured.factory((name) => (name === 'react' ? makeFakeReact() : {}))
+    loadedFrom = 'lib/client.js（构建产物）'
+  }
+}
+if (clientExports === null) {
+  const mod = { exports: {} }
+  new Function('require', 'module', 'exports', src)((name) => (name === 'react' ? makeFakeReact() : {}), mod, mod.exports)
+  clientExports = mod.exports
+  loadedFrom = 'client/index.js（源码，未能从 bundle 取到）'
+}
+console.log('  （渲染对象：' + loadedFrom + '）')
+await t('构建产物含本次隔离修复（bundle 不是旧的）', () => {
+  assert.match(bundleSrc, /SCHEMA_MISMATCH/, 'lib/client.js 里没有形状闸 → 忘了重建')
+  assert.match(bundleSrc, /已隔离/, 'lib/client.js 里没有渲染边界 → 忘了重建')
+})
+await t('客户端模块可加载且暴露 apply', () => assert.equal(typeof clientExports.apply, 'function'))
+clientExports.apply(fakeCtx)
 const cardSlot = slots.find((s) => s.spec.id === 'usage-card' && s.spec.name === 'sidebar.footer.action')
 await t('卡片组件注册进 sidebar.footer.action', () => assert.ok(cardSlot && typeof cardSlot.comp === 'function'))
 
