@@ -79,9 +79,9 @@ node scripts/install-local.mjs              # 链接进 web profile（不走 pnp
 node scripts/install-local.mjs --uninstall  # 可逆
 ```
 
-## 设置页（插件设置 tab）
+## 配置
 
-设置页里「用量卡片」是一项独立 tab：
+在插件管理器中打开 `dsh-usage-card` 组合包详情，可以编辑用量卡片的配置。修改写入 Web profile 的 `cordis.patch.yml`，Host 随后重新加载插件配置。
 
 | 项 | 说明 |
 |---|---|

@@ -24,30 +24,21 @@ export const name = 'usage-card'
 /** 依赖的服务；缺任一则 fiber 保持 pending，不会半死。sessions 用于按 id 解析客户端正在看的会话。 */
 export const inject = ['webServer', 'sessionProjections', 'sessions', 'sessionQuery', 'tokenMeter', 'settings']
 
-/** 设置页 namespace；与客户端设置卡片必须一致。 */
-export const SETTINGS_NAMESPACE = 'dsh-usage-card'
+/** Profile entry id used for this plugin's persisted configuration. */
+export const SETTINGS_ENTRY_ID = 'usage-card'
 
-/**
- * 设置页 schema。三个键都是「用户层覆盖」语义：
- * 留空则用 schema 默认值（与设计文稿一致的做法）。
- */
-export const SETTINGS_SCHEMA = z.object({
-  /** 展示汇率：美元 → 人民币。默认 7.2，用户可改，也可由同步写入。 */
-  fxRate: z.number().min(0.01).max(1000).default(7.2),
-  /** 是否在拉起 dsh 时自动同步一次汇率（一次 HTTP GET；失败保留现值）。 */
-  fxAuto: z.boolean().default(true),
-  /** 上一次同步写入的汇率。与 fxRate 不等 = 之后被人手改过，自动同步要让位。 */
-  fxSyncedRate: z.number().default(0),
-  /** 上一次成功同步的时间（ISO）与来源 id；空 = 从未同步过。 */
-  fxSyncedAt: z.string().default(''),
-  fxSource: z.string().default(''),
-  /** 是否在卡片上显示金额。与其它显示金额的插件同屏时可关掉。 */
-  showAmount: z.boolean().default(true),
-  /** 是否显示上下文占比这一整块。 */
-  showAttribution: z.boolean().default(true),
+/** Profile-backed preferences and sync metadata for this plugin entry. */
+export const Config = z.object({
+  fxRate: z.number().min(0.01).max(1000).default(7.2).volatile(),
+  fxAuto: z.boolean().default(true).volatile(),
+  fxSyncedRate: z.number().default(0).volatile(),
+  fxSyncedAt: z.string().default('').volatile(),
+  fxSource: z.string().default('').volatile(),
+  showAmount: z.boolean().default(true).volatile(),
+  showAttribution: z.boolean().default(true).volatile(),
 })
 
-/** 设置缺省值（scope 不可用时的兜底，与 schema 默认一致）。 */
+/** Defaults used when the profile entry has no explicit values. */
 export const SETTINGS_DEFAULTS = {
   fxRate: 7.2, fxAuto: true, fxSyncedRate: 0, fxSyncedAt: '', fxSource: '',
   showAmount: true, showAttribution: true,
@@ -705,36 +696,20 @@ export function buildPayload(ctx, session, model, settings = SETTINGS_DEFAULTS, 
  * 所有登记都是本 fiber 的 effect，卸载即回收。
  * @param ctx - 宿主上下文
  */
-export function apply(ctx) {
+export function apply(ctx, config) {
   let currentSession = null
   let currentModel = null
-  /** 设置作用域；注册在 effect 上，卸载即回收。 */
-  let settingsScope = null
-
-  /** 现读设置 —— 设置服务 applies 默认 'live'，保存后无需重启。 */
+  /** Read the current profile-backed plugin configuration. */
   const readSettings = () => {
-    let raw
-    try {
-      raw = settingsScope === null ? SETTINGS_DEFAULTS : settingsScope.get()
-    } catch {
-      return SETTINGS_DEFAULTS
-    }
-    // 防御：手改 settings.yaml 可以塞进 NaN / null / 负数，schema 层不一定挡住。
-    // 汇率非法就退回默认值 —— 否则金额会静默变成 ¥0.00（比报错更危险）。
-    const rate = Number(raw?.fxRate)
+    const raw = Object.fromEntries(Object.keys(SETTINGS_DEFAULTS).map((key) => [key, config[key].get()]))
+    const rate = Number(raw.fxRate)
     return {
-      ...SETTINGS_DEFAULTS,
       ...raw,
       fxRate: Number.isFinite(rate) && rate > 0 ? rate : SETTINGS_DEFAULTS.fxRate,
-      showAmount: raw?.showAmount !== false,
-      showAttribution: raw?.showAttribution !== false,
+      showAmount: raw.showAmount !== false,
+      showAttribution: raw.showAttribution !== false,
     }
   }
-
-  ctx.effect(() => {
-    settingsScope = ctx.settings.register(SETTINGS_NAMESPACE, SETTINGS_SCHEMA)
-    return () => { settingsScope = null }
-  }, 'usage-card: settings')
 
   // M6：拉起 dsh 时自动同步一次汇率。不 await —— 启动关键路径上不能等网络；
   // 也永不冒泡（失败只留日志），最坏情况就是沿用现值。
@@ -745,7 +720,7 @@ export function apply(ctx) {
         if (cancelled) return undefined
         return autoSyncFx({
           settings: readSettings(),
-          write: (patch) => (settingsScope === null ? Promise.resolve() : Promise.resolve(settingsScope.update(patch))),
+          write: (patch) => ctx.settings.update(SETTINGS_ENTRY_ID, patch),
           log: (level, message) => { try { ctx.logger?.[level]?.(message) } catch { /* 宿主无 logger 就只当无事发生 */ } },
         })
       })
@@ -1217,9 +1192,9 @@ export function apply(ctx) {
           // 手动同步也盖同一组戳：它同样是「从实时源拿到的值」。
           // 盖上之后 shouldAutoSync 才会认为「当前值没有被手改」，下一次拉起才会继续自动更新。
           const at = new Date().toISOString()
-          if (settingsScope !== null) {
-            await settingsScope.update({ fxRate: found.rate, fxSyncedRate: found.rate, fxSyncedAt: at, fxSource: found.source })
-          }
+          await ctx.settings.update(SETTINGS_ENTRY_ID, {
+            fxRate: found.rate, fxSyncedRate: found.rate, fxSyncedAt: at, fxSource: found.source,
+          })
           res.statusCode = 200
           res.end(JSON.stringify({ ok: true, rate: found.rate, source: found.source, at }))
         } catch (error) {

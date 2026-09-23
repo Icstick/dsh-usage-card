@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LEDGER_SCHEMA_VERSION, createLedger, foldRows, isLedgerRow, monthKeyOf, parseRow, readMonthFile, rowKey } from '../src/ledger.mjs'
 import { SETTINGS_DEFAULTS, apply } from '../src/index.mjs'
+const applyTest = (ctx) => apply(ctx, ctx.config)
 import { buildReport, renderMarkdown } from '../src/report.mjs'
 
 /** 插件版本从 package.json 读 —— 断言里写死版本号会在 bump 时无故变红（刚踩过）。 */
@@ -229,7 +230,8 @@ function makeCtx(session, listeners) {
       modelSelection: { lastUsed: { model: 'deepseek-flash' } },
     }, asOfSeq: session.seq }) },
     sessionQuery: {}, tokenMeter: {},
-    settings: { register: () => ({ get: () => ({ ...SETTINGS_DEFAULTS }), update: async () => {} }) },
+    config: Object.fromEntries(Object.entries({ ...SETTINGS_DEFAULTS, fxAuto: false }).map(([key, value]) => [key, { get: () => value }])),
+    settings: { update: async () => {} },
     connection: { requestRejection: () => undefined },
     on: (name, fn) => { listeners.push({ name, fn }); return () => {} },
     effect: (fn) => { const d = fn(); return () => { try { d?.() } catch { /* 已回收 */ } } },
@@ -250,7 +252,7 @@ try {
   const reads1 = { n: 0 }
   const session1 = makeSession({ reads: reads1, withEvents: false })
   const listeners = []
-  apply(makeCtx(session1, listeners))
+  applyTest(makeCtx(session1, listeners))
   const onEvent = listeners.find((l) => l.name === 'session/event')
   await t('apply 订阅了 session/event', () => assert.ok(onEvent, '应有 session/event 订阅'))
   for (const e of EVENTS) onEvent?.fn(session1, e)
@@ -271,7 +273,7 @@ try {
   const reads2 = { n: 0 }
   const session2 = makeSession({ reads: reads2, withEvents: true })
   const ctx2 = makeCtx(session2, [])
-  apply(ctx2)
+  applyTest(ctx2)
   const payload2 = await probe(ctx2)
   await t('重启后一次都不读 session.events（账本已覆盖到会话末尾）', () => {
     assert.equal(reads2.n, 0, '不该访问日志访问器')
@@ -292,7 +294,7 @@ try {
   const reads3 = { n: 0 }
   const session3 = makeSession({ reads: reads3, withEvents: true })
   const ctx3 = makeCtx(session3, [])
-  apply(ctx3)
+  applyTest(ctx3)
   const payload3 = await probe(ctx3)
   await t('账本为空时仍走日志回填（盖子没盖死）', () => {
     assert.equal(payload3.ok, true)
@@ -313,7 +315,7 @@ console.log('P0 回归：账本里的异常 seq 不许永久挡住日志')
     process.env.DSH_HOME = homeA
     const readsA = { n: 0 }
     const ctxA = makeCtx(makeSession({ reads: readsA, withEvents: true }), [])
-    apply(ctxA)
+    applyTest(ctxA)
     const payloadA = await probe(ctxA)
 
     // B：账本里混进一条 seq 远大于会话末尾的行（改过 seq 语义 / 手工拼回旧 pid 文件 / 会话 id 复用）
@@ -323,7 +325,7 @@ console.log('P0 回归：账本里的异常 seq 不许永久挡住日志')
     led.flush()
     const readsB = { n: 0 }
     const ctxB = makeCtx(makeSession({ reads: readsB, withEvents: true }), [])
-    apply(ctxB)
+    applyTest(ctxB)
     const payloadB = await probe(ctxB)
 
     await t('异常水位被忽略：日志照读，不去信那个 seq', () => {

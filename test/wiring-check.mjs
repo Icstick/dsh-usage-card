@@ -2,7 +2,8 @@
 // dev-lessons 第 21 条的教训：模块级测试全绿但接线从未插入 = 假绿。
 // 这里真的调 apply(ctx)，检验：路由注册到了预期路径、handler 返回可解析的 JSON、事件被跟踪。
 import assert from 'node:assert/strict'
-import { apply, ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SYNC_FX_ROUTE, SYNC_PRICES_ROUTE, localFenceRejection } from '../src/index.mjs'
+import { apply, ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SYNC_FX_ROUTE, SYNC_PRICES_ROUTE, SETTINGS_DEFAULTS, localFenceRejection } from '../src/index.mjs'
+const applyTest = (ctx) => apply(ctx, ctx.config)
 
 let pass = 0
 // 必须 await：handler 已是 async，断言与取回 body 都要等
@@ -30,14 +31,14 @@ const ctx = {
   // 事件与生命周期
   // connection 接缝：宿主信任栅栏。这里模拟「Host 非本机就 403」
   connection: { requestRejection: (req) => (req?.headers?.host === 'evil.example' ? 403 : undefined) },
-  // settings 接缝：注册后返回作用域，可读取
-  settings: { register: () => ({ get: () => ({ fxRate: 7.2, showAmount: true, showAttribution: true }) }) },
+  config: Object.fromEntries(Object.entries({ ...SETTINGS_DEFAULTS, fxAuto: false }).map(([key, value]) => [key, { get: () => value }])),
+  settings: { update: async () => {} },
   on: (name, fn) => { listeners.set(name, fn); return () => { listeners.delete(name) } },
   effect: (fn) => { const d = fn(); if (typeof d === 'function') effects.push(d) },
 }
 
 console.log('接线')
-await t('apply 可调用且不抛', () => apply(ctx))
+await t('apply 可调用且不抛', () => applyTest(ctx))
 await t('五条路由都注册了（卡片 + 报告 + 会话列表 + 汇率同步 + 价目同步）', () => {
   assert.equal(registered.length, 5)
   for (const path of [ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SYNC_FX_ROUTE, SYNC_PRICES_ROUTE]) {
@@ -89,7 +90,7 @@ await t('handler 抛错也被兜住（返回 INTERNAL 而不是崩宿主）', as
   const bad = { ...ctx, sessionProjections: { snapshot: () => { throw new Error('boom') } } }
   const capture = []
   const c2 = { ...bad, webServer: { register: (s) => { capture.push(s); return () => {} } } }
-  apply(c2)
+  applyTest(c2)
   // 新实例有自己的闭包，必须先喂一个事件它才知道「当前会话」是哪个
   listeners.get('session/event')(fakeSession, { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } })
   let body = ''
@@ -117,7 +118,7 @@ const ctx2 = {
 }
 const capture2 = []
 const c3 = { ...ctx2, webServer: { register: (s) => { capture2.push(s); return () => {} } } }
-apply(c3)
+applyTest(c3)
 listeners.get('session/event')(fakeSession, { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } })
 const call2 = async (url) => {
   let body = ''
@@ -174,7 +175,7 @@ await t('本地兜底栅栏：非回环对端 → 403', () => {
 await t('宿主的 connection 服务缺席时 → 退到本地栅栏，而不是一律 403（第一版就栽在这）', async () => {
   const capture = []
   const noFence = { ...ctx, connection: undefined, webServer: { register: (s) => { capture.push(s); return () => {} } } }
-  apply(noFence)
+  applyTest(noFence)
   let body = ''
   const res = { statusCode: 0, headers: {}, setHeader(n, v) { this.headers[n] = v }, writeHead(c, h) { this.statusCode = c; Object.assign(this.headers, h ?? {}) }, end(chunk) { body += chunk ?? '' } }
   await capture[0].handler({ url: ROUTE, method: 'GET', headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } }, res)
@@ -206,26 +207,15 @@ await t('汇率同步路由：只收 POST，且同样过栅栏', async () => {
   assert.equal(evil.statusCode, 403, '恶意 Host 必须被挡在栅栏外')
 })
 
-console.log('设置接缝')
-// 注意：探针必须在最后跑 —— 它复用了同一个 listeners Map，会把前面实例的监听器顶掉
-await t('注册了设置命名空间（供设置页读写）', () => {
-  let registeredNs = null
-  const probe = {
-    ...ctx,
-    settings: { register: (ns) => { registeredNs = ns; return { get: () => ({ fxRate: 7.2, showAmount: true, showAttribution: true }) } } },
-  }
-  apply(probe)
-  assert.equal(registeredNs, 'dsh-usage-card')
-})
-
-await t('设置里塞 NaN 汇率 → 退回默认 7.2（不静默算成 ¥0.00）', async () => {
+console.log('配置读取')
+await t('配置里塞 NaN 汇率 → 退回默认 7.2（不静默算成 ¥0.00）', async () => {
   const capture = []
   const bad = {
     ...ctx,
-    settings: { register: () => ({ get: () => ({ fxRate: Number.NaN, showAmount: true, showAttribution: true }) }) },
+    config: Object.fromEntries(Object.entries({ ...SETTINGS_DEFAULTS, fxAuto: false, fxRate: Number.NaN }).map(([key, value]) => [key, { get: () => value }])),
     webServer: { register: (s) => { capture.push(s); return () => {} } },
   }
-  apply(bad)
+  applyTest(bad)
   listeners.get('session/event')(fakeSession, { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } })
   let body = ''
   await capture[0].handler(
@@ -252,7 +242,7 @@ await t('同一投影水位重复请求 → measure() 只调一次（缓存生�
     },
     webServer: { register: (s) => { capture.push(s); return () => {} } },
   }
-  apply(ctxC)
+  applyTest(ctxC)
   listeners.get('session/event')(fakeSession, { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } })
   const hit = async () => {
     let body = ''
@@ -284,7 +274,7 @@ await t('水位前进 → 缓存失效并重算', async () => {
     },
     webServer: { register: (s) => { capture.push(s); return () => {} } },
   }
-  apply(ctxD)
+  applyTest(ctxD)
   listeners.get('session/event')(fakeSession, { type: 'request/header', data: { header: { config: { model: 'deepseek-flash' } } } })
   const hit = async () => {
     let body = ''
@@ -320,7 +310,7 @@ await t('历史回填：session.events 里的老轮次被补进账本（覆盖�
     },
     webServer: { register: (s) => { captureB.push(s); return () => {} } },
   }
-  apply(ctxB)
+  applyTest(ctxB)
   let body = ''
   await captureB[0].handler(
     { url: ROUTE + '?session=sess-backfill', method: 'GET', headers: { host: '127.0.0.1:3080' }, socket: { remoteAddress: '127.0.0.1' } },

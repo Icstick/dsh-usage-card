@@ -117,15 +117,16 @@ await t('从未同步过 → status=manual', () => {
 })
 
 console.log('拉起时真的会同步（假 ctx 跑 apply）')
-function fakeCtx(settingsScope) {
+function fakeCtx(config, writes = []) {
   const registered = []
   return {
     registered,
+    config: Object.fromEntries(Object.entries(config).map(([key, value]) => [key, { get: () => value }])),
     webServer: { register: (spec) => { registered.push(spec); return () => {} } },
     sessionProjections: { snapshot: () => ({ values: {} }) },
     sessions: {}, sessionQuery: {}, tokenMeter: {},
     connection: { requestRejection: () => undefined },
-    settings: { register: () => settingsScope },
+    settings: { update: async (entryId, patch) => { writes.push({ entryId, ...patch }) } },
     on: () => () => {},
     effect: (fn) => { const d = fn(); return () => { try { d?.() } catch {} } },
     logger: { info: () => {}, warn: () => {} },
@@ -135,27 +136,25 @@ const realFetch = globalThis.fetch
 try {
   await t('apply 会在启动时自动拉一次汇率并写入设置', async () => {
     const writes = []
-    const scope = { get: () => ({ ...SETTINGS_DEFAULTS }), update: (p) => { writes.push(p) } }
     globalThis.fetch = fakeFetch({ 'open.er-api.com': 6.99 })
-    apply(fakeCtx(scope))
+    { const ctx = fakeCtx({ ...SETTINGS_DEFAULTS }, writes); apply(ctx, ctx.config) }
     // 自动同步是 fire-and-forget：给它几个微任务的时间落地
     for (let i = 0; i < 20 && writes.length === 0; i += 1) await new Promise((r) => setTimeout(r, 5))
     assert.equal(writes.length, 1, '启动时应写入一次')
+    assert.equal(writes[0].entryId, 'usage-card')
     assert.equal(writes[0].fxRate, 6.99)
     assert.equal(writes[0].fxSource, 'open.er-api.com')
   })
   await t('网络挂起时 apply 立刻返回、不抛、不阻塞', async () => {
-    const scope = { get: () => ({ ...SETTINGS_DEFAULTS }), update: () => { throw new Error('should not be called') } }
     globalThis.fetch = () => new Promise(() => {})   // 永不 resolve
     const started = Date.now()
-    apply(fakeCtx(scope))
+    { const ctx = fakeCtx({ ...SETTINGS_DEFAULTS }); apply(ctx, ctx.config) }
     assert.ok(Date.now() - started < 1000, 'apply 不能等网络')
     await new Promise((r) => setTimeout(r, 30))
   })
   await t('所有源都挂时 apply 不冒泡（只留日志）', async () => {
-    const scope = { get: () => ({ ...SETTINGS_DEFAULTS }), update: () => { throw new Error('nope') } }
     globalThis.fetch = async () => { throw new Error('offline') }
-    apply(fakeCtx(scope))
+    { const ctx = fakeCtx({ ...SETTINGS_DEFAULTS }); apply(ctx, ctx.config) }
     await new Promise((r) => setTimeout(r, 30))
   })
 } finally {

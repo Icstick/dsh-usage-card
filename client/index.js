@@ -313,8 +313,8 @@ function Card(props) {
         : null) : null)
 }
 
-/** 设置页 namespace，必须与宿主侧 SETTINGS_NAMESPACE 一致。 */
-const NS = 'dsh-usage-card'
+/** Profile entry id whose Host configuration the bundle page edits. */
+const ENTRY_ID = 'usage-card'
 
 /** 设置项定义（顺序即渲染顺序）。留空 = 用设计默认值。 */
 const FIELDS = [
@@ -344,12 +344,12 @@ function parseNumber(text) {
 }
 
 /**
- * 设置页 section 组件工厂（自包含：闭包捕获 bound scope）。
- * @param {object} scope - ctx.settingsScope.bind({ namespace })
+ * Bundle configuration page component factory.
+ * @param {object} form - shared configuration form for the Host entry.
  */
-function makeSettingsSection(scope) {
+function makeSettingsSection(form) {
   return function UsageCardSettings() {
-    const snapshot = useSyncExternalStore((cb) => scope.subscribe(cb), () => scope.getSnapshot())
+    const snapshot = useSyncExternalStore((cb) => form.subscribe(cb), () => form.getSnapshot())
     const value = snapshot && typeof snapshot.value === 'object' && snapshot.value !== null ? snapshot.value : {}
     const userLayer = snapshot && typeof snapshot.user === 'object' && snapshot.user !== null ? snapshot.user : {}
     const writable = snapshot ? snapshot.writable === true : false
@@ -403,8 +403,12 @@ function makeSettingsSection(scope) {
     const save = (patch) => {
       setSaving(true)
       setFailed(false)
-      Promise.resolve(scope.update(patch))
-        .then(() => { setSaving(false); setDraft(null) })
+      Promise.all(Object.entries(patch).map(([field, value]) => form.set(field, value)))
+        .then((results) => {
+          if (results.some(accepted => accepted !== true)) throw new Error('settings write refused')
+          setSaving(false)
+          setDraft(null)
+        })
         .catch(() => { setSaving(false); setFailed(true) })
     }
 
@@ -601,16 +605,12 @@ function apply(ctx) {
     { name: 'conversation.composer.dock', id: 'usage-card-beacon', order: 99 },
     SessionBeacon,
   ))
-  // 设置页 section（settingsScope 由 ui-settings 提供；缺席时跳过而不是崩）
-  if (ctx.settingsScope && typeof ctx.settingsScope.bind === 'function') {
-    const scope = ctx.settingsScope.bind({ namespace: NS })
-    ctx.slots.inject('settings.section', () => ctx.slots.register(
-      { name: 'settings.section', id: 'usage-card', order: 170, label: '用量卡片' },
-      withBoundary(makeSettingsSection(scope)),
-    ))
-  }
+  ctx.effect(() => ctx.configForms.whileServed([ENTRY_ID], () => ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register(
+    { name: 'plugins.bundle.config', key: 'dsh-usage-card' },
+    withBoundary(makeSettingsSection(ctx.configForms.get(ENTRY_ID))),
+  ))), 'usage-card: bundle settings page')
 }
 
-exports.inject = ['slots', 'settingsScope']
+exports.inject = ['slots', 'configForms']
 // build.mjs 模板注入 exports.apply
 exports.apply = apply

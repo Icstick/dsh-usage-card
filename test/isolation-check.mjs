@@ -21,22 +21,23 @@ const t = async (name, fn) => {
 }
 
 // ── A. 宿主半 ────────────────────────────────────────────────────────────────
-const { apply, ROUTE, REPORT_ROUTE, SESSIONS_ROUTE } = await import('../src/index.mjs')
+const { apply, ROUTE, REPORT_ROUTE, SESSIONS_ROUTE, SETTINGS_DEFAULTS } = await import('../src/index.mjs')
 
 const registered = []
 const listeners = new Map()
 const ctx = {
+  config: Object.fromEntries(Object.entries({ ...SETTINGS_DEFAULTS, fxAuto: false }).map(([key, value]) => [key, { get: () => value }])),
   webServer: { register: (spec) => { registered.push(spec); return () => {} } },
   sessionProjections: { snapshot: () => ({ values: {
     tokenUsage: { uncachedInputTokens: 10, cacheReadTokens: 20, cacheWriteTokens: 0, outputTokens: 5 },
     contextBreakdown: { systemTokens: 1, toolsTokens: 1, messageTokens: 1 },
   } }) },
   connection: { requestRejection: () => undefined },
-  settings: { register: () => ({ get: () => ({ fxRate: 7.2, showAmount: true, showAttribution: true }) }) },
+  settings: { update: async () => {} },
   on: (n, fn) => { listeners.set(n, fn); return () => {} },
   effect: (fn) => { fn() },
 }
-apply(ctx)
+apply(ctx, ctx.config)
 const handlerOf = (path) => registered.find((r) => r.path === path)?.handler
 
 async function call(path, url, init = {}) {
@@ -173,7 +174,11 @@ const fakeCtx = {
     inject: (name, fn) => { fn({ slots: { register: (spec, comp) => { slots.push({ spec, comp }); return () => {} } } }); return () => {} },
     register: (spec, comp) => { slots.push({ spec, comp }); return () => {} },
   },
-  settingsScope: { bind: () => ({ subscribe: () => () => {}, getSnapshot: () => ({}), set: () => {} }) },
+  configForms: {
+    whileServed: (_entries, register) => register(),
+    get: () => ({ subscribe: () => () => {}, getSnapshot: () => ({}), set: async () => true }),
+  },
+  effect: (register) => register(),
 }
 // 优先跑**构建产物** lib/client.js（那才是真正发出去、真正装在侧栏里的东西）：
 // 只跑源码的话，忘了重建 bundle 也能全绿 —— 这正是别的插件踩过的坑。
@@ -200,9 +205,11 @@ await t('构建产物含本次隔离修复（bundle 不是旧的）', () => {
   assert.match(bundleSrc, /已隔离/, 'lib/client.js 里没有渲染边界 → 忘了重建')
 })
 await t('客户端模块可加载且暴露 apply', () => assert.equal(typeof clientExports.apply, 'function'))
+await t('客户端等待当前配置服务', () => assert.deepEqual(clientExports.inject, ['slots', 'configForms']))
 clientExports.apply(fakeCtx)
 const cardSlot = slots.find((s) => s.spec.id === 'usage-card' && s.spec.name === 'sidebar.footer.action')
 await t('卡片组件注册进 sidebar.footer.action', () => assert.ok(cardSlot && typeof cardSlot.comp === 'function'))
+await t('配置页注册在组合包详情', () => assert.ok(slots.some((s) => s.spec.name === 'plugins.bundle.config' && s.spec.key === 'dsh-usage-card')))
 
 /** 宽态（展开的面板）单独渲染 —— 宽窄两条路径的护栏必须分别断言，混在一起会漏掉一侧。 */
 function renderWide(payload, error, detailOpen = false) {
